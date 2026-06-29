@@ -185,32 +185,95 @@ composer.callbackQuery(/^room:settings:(.+)$/, async (ctx) => {
 });
 
 composer.callbackQuery(/^room:setmax:(.+):(\d+)$/, async (ctx) => {
-  await ctx.answerCallbackQuery();
   const rid = ctx.match![1];
   const val = parseInt(ctx.match![2], 10);
   const room = await readRoom(rid);
-  if (!room || room.host_id !== ctx.from!.id) return;
-  if (room.game) return;
+  if (!room || room.host_id !== ctx.from!.id) {
+    await ctx.answerCallbackQuery({ text: "Only the host can change settings.", show_alert: true });
+    return;
+  }
+  if (room.game) {
+    await ctx.answerCallbackQuery({ text: "Can't change settings after the game starts.", show_alert: true });
+    return;
+  }
 
   room.max_players = val;
   await saveRoom(room);
-
-  // Re-render settings
   await ctx.answerCallbackQuery({ text: `Max players set to ${val}.`, show_alert: false });
-  // Trigger re-render by simulating a fresh settings view
+
+  // Re-render the settings view with the new value
+  const playerCounts = [2, 3, 4, 5, 6];
+  const handSizes = [4, 5, 6];
+  await ctx.editMessageText(
+    `⚙️ Room ${rid} settings\n\n` +
+    `Max players: ${room.max_players}\n` +
+    `Hand size: ${room.initial_hand_size}\n\n` +
+    `Tap a setting to change it:`,
+    {
+      reply_markup: inlineKeyboard([
+        ...playerCounts.map((n) => [
+          inlineButton(
+            `${n} player${n !== 1 ? "s" : ""}${n === room.max_players ? " ✅" : ""}`,
+            `room:setmax:${rid}:${n}`,
+          ),
+        ]),
+        [inlineButton("▬▬▬ Hand size ▬▬▬", "nop:settings")],
+        ...handSizes.map((n) => [
+          inlineButton(
+            `${n} card${n !== 1 ? "s" : ""}${n === room.initial_hand_size ? " ✅" : ""}`,
+            `room:sethand:${rid}:${n}`,
+          ),
+        ]),
+        [inlineButton("⬅️ Back to room", `room:refresh:${rid}`)],
+      ]),
+    },
+  );
 });
 
 composer.callbackQuery(/^room:sethand:(.+):(\d+)$/, async (ctx) => {
-  await ctx.answerCallbackQuery();
   const rid = ctx.match![1];
   const val = parseInt(ctx.match![2], 10);
   const room = await readRoom(rid);
-  if (!room || room.host_id !== ctx.from!.id) return;
-  if (room.game) return;
+  if (!room || room.host_id !== ctx.from!.id) {
+    await ctx.answerCallbackQuery({ text: "Only the host can change settings.", show_alert: true });
+    return;
+  }
+  if (room.game) {
+    await ctx.answerCallbackQuery({ text: "Can't change settings after the game starts.", show_alert: true });
+    return;
+  }
 
   room.initial_hand_size = val;
   await saveRoom(room);
   await ctx.answerCallbackQuery({ text: `Hand size set to ${val}.`, show_alert: false });
+
+  // Re-render the settings view with the new value
+  const playerCounts = [2, 3, 4, 5, 6];
+  const handSizes = [4, 5, 6];
+  await ctx.editMessageText(
+    `⚙️ Room ${rid} settings\n\n` +
+    `Max players: ${room.max_players}\n` +
+    `Hand size: ${room.initial_hand_size}\n\n` +
+    `Tap a setting to change it:`,
+    {
+      reply_markup: inlineKeyboard([
+        ...playerCounts.map((n) => [
+          inlineButton(
+            `${n} player${n !== 1 ? "s" : ""}${n === room.max_players ? " ✅" : ""}`,
+            `room:setmax:${rid}:${n}`,
+          ),
+        ]),
+        [inlineButton("▬▬▬ Hand size ▬▬▬", "nop:settings")],
+        ...handSizes.map((n) => [
+          inlineButton(
+            `${n} card${n !== 1 ? "s" : ""}${n === room.initial_hand_size ? " ✅" : ""}`,
+            `room:sethand:${rid}:${n}`,
+          ),
+        ]),
+        [inlineButton("⬅️ Back to room", `room:refresh:${rid}`)],
+      ]),
+    },
+  );
 });
 
 composer.callbackQuery(/^room:refresh:(.+)$/, async (ctx) => {
@@ -263,37 +326,7 @@ composer.on("message:text", async (ctx, next) => {
   await handleJoinRoom(ctx, rid);
 });
 
-// ---- join_ link: handle /start join_XXXXXX via text detection ----
-
-composer.on("message:text", async (ctx, next) => {
-  const text = ctx.message.text.trim();
-  const match = text.match(/^\/start\s+join_([A-Z0-9]{6})$/i);
-  if (!match) return next();
-
-  const rid = match[1].toUpperCase();
-  await handleJoinByDeepLink(ctx, rid);
-});
-
-async function handleJoinByDeepLink(ctx: Ctx, rid: string): Promise<void> {
-  const uid = ctx.from!.id;
-
-  // Check if user is already in another room
-  const existingRid = await getUserRoom(uid);
-  if (existingRid && existingRid !== rid) {
-    const existing = await readRoom(existingRid);
-    if (existing?.game && existing.game.phase !== "ended") {
-      await ctx.reply(
-        "You're in an active game right now. Use /leave to drop out of it first, then join a new one.",
-      );
-      return;
-    }
-    // Leave the old lobby room silently
-    await leaveCurrentRoom(uid);
-  }
-
-  // Proceed with join
-  await doJoinRoom(ctx, rid, uid);
-}
+// ---- handleJoinRoom (used by room:join text input) ----
 
 async function handleJoinRoom(ctx: Ctx, rid: string): Promise<void> {
   const uid = ctx.from!.id;

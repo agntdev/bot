@@ -1,0 +1,16 @@
+[
+  {
+    "name": "/start with deep-link join code shows room-not-found when room doesn't exist",
+    "steps": [
+      {
+        "send": { "text": "/start join_ABC123" },
+        "expect": [
+          {
+            "method": "sendMessage",
+            "payload": { "text": "Couldn't find that room — it may have ended. Ask the host for a fresh invite link." }
+          }
+        ]
+      }
+    ]
+  }
+]

@@ -1,0 +1,36 @@
+[
+  {
+    "name": "room settings page shows player counts and hand sizes",
+    "steps": [
+      {
+        "send": { "callback": "room:settings:TEST01" },
+        "expect": [
+          { "method": "answerCallbackQuery" },
+          { "method": "sendMessage" }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "room setmax on unknown room answers gracefully",
+    "steps": [
+      {
+        "send": { "callback": "room:setmax:TEST01:4" },
+        "expect": [
+          { "method": "answerCallbackQuery" }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "room sethand on unknown room answers gracefully",
+    "steps": [
+      {
+        "send": { "callback": "room:sethand:TEST01:5" },
+        "expect": [
+          { "method": "answerCallbackQuery" }
+        ]
+      }
+    ]
+  }
+]
