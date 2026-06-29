@@ -16,7 +16,7 @@ export interface StoredPlayer {
   user_id: number;
   telegram_name: string;
   hand: StoredCard[];
-  status: "lobby" | "playing" | "durak" | "left";
+  status: "lobby" | "playing" | "durak" | "out" | "left";
 }
 
 export interface StoredGameState {

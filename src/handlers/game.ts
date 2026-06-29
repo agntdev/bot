@@ -3,6 +3,7 @@ import type { Ctx } from "../bot.js";
 import {
   readRoom,
   saveRoom,
+  updateRoom,
   deleteRoom,
   getUserRoom,
   type StoredGameState,
@@ -23,6 +24,19 @@ const composer = new Composer<Ctx>();
 
 // ---- helpers ----
 
+/** Thrown inside updateRoom's mutate callback to signal a non-retryable
+ *  validation failure (e.g. wrong player, wrong phase). The caller catches
+ *  it and shows the message to the actor. */
+class GameActionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GameActionError";
+  }
+  static is(err: unknown): err is GameActionError {
+    return err instanceof GameActionError;
+  }
+}
+
 function initialHandSize(room: StoredRoom): number {
   return room.initial_hand_size;
 }
@@ -30,7 +44,7 @@ function initialHandSize(room: StoredRoom): number {
 function drawCards(game: StoredGameState, count: number): StoredCard[] {
   const drawn: StoredCard[] = [];
   while (count > 0 && game.deck.length > 0) {
-    drawn.push(game.deck.pop()!);
+    drawn.push(game.deck.shift()!);
     count--;
   }
   return drawn;
@@ -60,13 +74,25 @@ function nextAttackerDefender(game: StoredGameState): void {
 }
 
 function checkGameEnd(g: StoredGameState): boolean {
+  // A player who empties their hand when the deck is exhausted has finished
+  // — they are NOT the дурак (loser). Only the last player holding cards loses.
   for (const p of g.players) {
     if (p.status === "playing" && p.hand.length === 0 && g.deck.length === 0) {
-      p.status = "durak";
+      p.status = "out";
     }
   }
   const playingNow = g.players.filter((p) => p.status === "playing");
   if (playingNow.length < 2) {
+    // The last player still "playing" is the дурак (loser)
+    if (playingNow.length === 1) {
+      playingNow[0].status = "durak";
+    }
+    // also mark any "out" players who haven't been formally designated
+    for (const p of g.players) {
+      if (p.status === "playing" && p.hand.length === 0) {
+        p.status = "out";
+      }
+    }
     g.phase = "ended";
     return true;
   }
@@ -79,15 +105,10 @@ function isPlayerActive(p: StoredPlayer): boolean {
 
 // ---- defensive helpers ----
 
-interface LoadedRoom {
-  room: StoredRoom;
-  game: StoredGameState;
-}
-
 async function loadRoomGame(
   ctx: Ctx,
   rid: string,
-): Promise<LoadedRoom | null> {
+): Promise<StoredRoom | null> {
   const room = await readRoom(rid);
   if (!room) {
     console.warn("[game] room not found", { rid, userId: ctx.from?.id });
@@ -103,7 +124,7 @@ async function loadRoomGame(
     try { await ctx.reply("That game's already over!"); } catch {}
     return null;
   }
-  return { room, game: room.game };
+  return room;
 }
 
 async function checkTurnDeadline(
@@ -162,9 +183,9 @@ composer.callbackQuery(/^atk:(.+):(\d+)$/, async (ctx) => {
 
   console.log("[game] attack:card", { rid, idx, uid });
 
-  const loaded = await loadRoomGame(ctx, rid);
-  if (!loaded) return;
-  const { room, game: g } = loaded;
+  const room = await loadRoomGame(ctx, rid);
+  if (!room) return;
+  const g = room.game!;
 
   if (!(await checkTurnDeadline(ctx, g, rid, room))) return;
 
@@ -180,7 +201,7 @@ composer.callbackQuery(/^atk:(.+):(\d+)$/, async (ctx) => {
       rid, uid, attackerId: attacker.user_id, phase: g.phase,
     });
     if (g.phase === "podkid" && g.players[g.defender_idx]?.user_id !== uid) {
-      return handlePodkid(ctx, g, rid, uid, idx, room);
+      return handlePodkid(ctx, g, rid, uid, idx);
     }
     await ctx.answerCallbackQuery({ text: "Not your turn to attack.", show_alert: true });
     return;
@@ -208,19 +229,46 @@ composer.callbackQuery(/^atk:(.+):(\d+)$/, async (ctx) => {
     return;
   }
 
-  const card = attacker.hand.splice(idx, 1)[0];
-  g.table.push({ attack: card });
-  g.turn_deadline = now() + TURN_TIMEOUT_MS;
+  const card = attacker.hand[idx];
+  const deadline = now() + TURN_TIMEOUT_MS;
 
   console.log("[game] attack played", {
-    rid, uid, card: cardToString(card), tableSize: g.table.length,
+    rid, uid, card: cardToString(card), tableSize: g.table.length + 1,
   });
 
-  await saveRoom(room);
-  scheduleTurnTimer(ctx.api, rid, g.turn_deadline);
-  await broadcastPublicStateApi(ctx.api, g);
-  await sendPrivateHandApi(ctx.api, g, attacker, rid);
-  await sendPrivateHandApi(ctx.api, g, g.players[g.defender_idx], rid);
+  let updatedRoom: StoredRoom;
+  try {
+    updatedRoom = await updateRoom(rid, (fresh) => {
+      const fg = fresh.game;
+      if (!fg || fg.phase === "ended") throw new GameActionError("Game already ended.");
+      if (fg.phase !== "attack") throw new GameActionError("Phase changed — not attack anymore.");
+      const fa = fg.players[fg.attacker_idx];
+      if (!fa || fa.user_id !== uid) throw new GameActionError("You're no longer the attacker.");
+
+      // Re-check card index under lock
+      if (!fa.hand[idx]) throw new GameActionError("Card isn't in your hand anymore.");
+      if (fg.table.length > 0 && !tableRanks(fg.table).has(fa.hand[idx].rank)) {
+        throw new GameActionError("That rank can't be played anymore.");
+      }
+      if (fg.table.length >= 6) throw new GameActionError("Table is full.");
+
+      const played = fa.hand.splice(idx, 1)[0];
+      fg.table.push({ attack: played });
+      fg.turn_deadline = deadline;
+    });
+  } catch (err) {
+    if (GameActionError.is(err)) {
+      await ctx.reply(err.message);
+      return;
+    }
+    throw err;
+  }
+
+  const ug = updatedRoom.game!;
+  scheduleTurnTimer(ctx.api, rid, ug.turn_deadline);
+  await broadcastPublicStateApi(ctx.api, ug);
+  await sendPrivateHandApi(ctx.api, ug, ug.players[ug.attacker_idx], rid);
+  await sendPrivateHandApi(ctx.api, ug, ug.players[ug.defender_idx], rid);
 });
 
 // ---- defend:card callback ----
@@ -233,9 +281,9 @@ composer.callbackQuery(/^def:(.+):(\d+)$/, async (ctx) => {
 
   console.log("[game] defend:card", { rid, idx, uid });
 
-  const loaded = await loadRoomGame(ctx, rid);
-  if (!loaded) return;
-  const { room, game: g } = loaded;
+  const room = await loadRoomGame(ctx, rid);
+  if (!room) return;
+  const g = room.game!;
 
   if (!(await checkTurnDeadline(ctx, g, rid, room))) return;
 
@@ -277,30 +325,56 @@ composer.callbackQuery(/^def:(.+):(\d+)$/, async (ctx) => {
     return;
   }
 
-  defender.hand.splice(idx, 1);
-  g.table[undefendedIdx].defend = defendCard;
-
   console.log("[game] defended", {
     rid, uid, defendCard: cardToString(defendCard), vs: cardToString(attack),
   });
 
-  const allDefended = g.table.every((p) => p.defend);
-  if (allDefended) {
-    g.phase = "podkid";
-    g.turn_deadline = now() + TURN_TIMEOUT_MS;
+  const newDeadline = now() + TURN_TIMEOUT_MS;
+  let updatedRoom: StoredRoom;
+  let allDefended = false;
+  try {
+    updatedRoom = await updateRoom(rid, (fresh) => {
+      const fg = fresh.game;
+      if (!fg || fg.phase === "ended") throw new GameActionError("Game already ended.");
+      if (fg.phase !== "defend") throw new GameActionError("Phase changed — not defend anymore.");
+      const fd = fg.players[fg.defender_idx];
+      if (!fd || fd.user_id !== uid) throw new GameActionError("You're no longer the defender.");
+      if (!fd.hand[idx]) throw new GameActionError("Card isn't in your hand anymore.");
+
+      const uIdx = fg.table.findIndex((p) => !p.defend);
+      if (uIdx === -1) throw new GameActionError("All attacks are already covered.");
+
+      const atk = fg.table[uIdx].attack;
+      if (!cardBeats(atk, fd.hand[idx], fg.trump_suit)) {
+        throw new GameActionError("That card can't beat the attack anymore.");
+      }
+
+      const dc = fd.hand.splice(idx, 1)[0];
+      fg.table[uIdx].defend = dc;
+
+      allDefended = fg.table.every((p) => p.defend);
+      if (allDefended) {
+        fg.phase = "podkid";
+        fg.turn_deadline = newDeadline;
+      }
+    });
+  } catch (err) {
+    if (GameActionError.is(err)) {
+      await ctx.reply(err.message);
+      return;
+    }
+    throw err;
   }
 
-  await saveRoom(room);
-  if (allDefended) scheduleTurnTimer(ctx.api, rid, g.turn_deadline);
-  await broadcastPublicStateApi(ctx.api, g);
-  await sendPrivateHandApi(ctx.api, g, defender, rid);
+  const ug = updatedRoom.game!;
+  if (allDefended) scheduleTurnTimer(ctx.api, rid, ug.turn_deadline);
+  await broadcastPublicStateApi(ctx.api, ug);
+  await sendPrivateHandApi(ctx.api, ug, ug.players[ug.defender_idx], rid);
 
-  // When transitioning to podkid, update ALL non-defender players'
-  // hands so they see podkid action buttons.
   if (allDefended) {
-    for (const p of g.players) {
-      if (p.status === "playing" && p.user_id !== defender.user_id) {
-        await sendPrivateHandApi(ctx.api, g, p, rid);
+    for (const p of ug.players) {
+      if (p.status === "playing" && p.user_id !== ug.players[ug.defender_idx]?.user_id) {
+        await sendPrivateHandApi(ctx.api, ug, p, rid);
       }
     }
   }
@@ -314,7 +388,6 @@ async function handlePodkid(
   rid: string,
   uid: number,
   idx: number,
-  room: StoredRoom,
 ): Promise<void> {
   const player = g.players.find((p) => p.user_id === uid);
   if (!player || player.status !== "playing") {
@@ -340,19 +413,48 @@ async function handlePodkid(
     return;
   }
 
-  const card = player.hand.splice(idx, 1)[0];
-  g.table.push({ attack: card });
-  g.turn_deadline = now() + TURN_TIMEOUT_MS;
+  const card = player.hand[idx];
+  const deadline = now() + TURN_TIMEOUT_MS;
 
   console.log("[game] podkid card", {
-    rid, uid, card: cardToString(card), tableSize: g.table.length,
+    rid, uid, card: cardToString(card), tableSize: g.table.length + 1,
   });
 
-  await saveRoom(room);
-  scheduleTurnTimer(ctx.api, rid, g.turn_deadline);
-  await broadcastPublicStateApi(ctx.api, g);
-  await sendPrivateHandApi(ctx.api, g, player, rid);
-  await sendPrivateHandApi(ctx.api, g, g.players[g.defender_idx], rid);
+  let updatedRoom: StoredRoom;
+  try {
+    updatedRoom = await updateRoom(rid, (fresh) => {
+      const fg = fresh.game;
+      if (!fg || fg.phase === "ended") throw new GameActionError("Game already ended.");
+      if (fg.phase !== "podkid") throw new GameActionError("Not the podkid phase anymore.");
+      const fp = fg.players.find((p) => p.user_id === uid);
+      if (!fp || fp.status !== "playing") throw new GameActionError("You're no longer playing.");
+      if (fg.players[fg.defender_idx]?.user_id === uid) {
+        throw new GameActionError("Defender can't toss in cards.");
+      }
+      if (!fp.hand[idx]) throw new GameActionError("Card isn't in your hand anymore.");
+      if (!tableRanks(fg.table).has(fp.hand[idx].rank)) {
+        throw new GameActionError("That rank can't be tossed in anymore.");
+      }
+      if (fg.table.length >= 6) throw new GameActionError("Table is full.");
+
+      const pc = fp.hand.splice(idx, 1)[0];
+      fg.table.push({ attack: pc });
+      fg.turn_deadline = deadline;
+    });
+  } catch (err) {
+    if (GameActionError.is(err)) {
+      await ctx.reply(err.message);
+      return;
+    }
+    throw err;
+  }
+
+  const ug = updatedRoom.game!;
+  scheduleTurnTimer(ctx.api, rid, ug.turn_deadline);
+  await broadcastPublicStateApi(ctx.api, ug);
+  const podPlayer = ug.players.find((p) => p.user_id === uid)!;
+  await sendPrivateHandApi(ctx.api, ug, podPlayer, rid);
+  await sendPrivateHandApi(ctx.api, ug, ug.players[ug.defender_idx], rid);
 }
 
 // ---- podkid:card callback ----
@@ -365,9 +467,9 @@ composer.callbackQuery(/^pod:(.+):(\d+)$/, async (ctx) => {
 
   console.log("[game] podkid:card", { rid, idx, uid });
 
-  const loaded = await loadRoomGame(ctx, rid);
-  if (!loaded) return;
-  const { room, game: g } = loaded;
+  const room = await loadRoomGame(ctx, rid);
+  if (!room) return;
+  const g = room.game!;
 
   if (!(await checkTurnDeadline(ctx, g, rid, room))) return;
 
@@ -388,7 +490,7 @@ composer.callbackQuery(/^pod:(.+):(\d+)$/, async (ctx) => {
     return;
   }
 
-  return handlePodkid(ctx, g, rid, uid, idx, room);
+  return handlePodkid(ctx, g, rid, uid, idx);
 });
 
 // ---- take action ----
@@ -400,9 +502,9 @@ composer.callbackQuery(/^take:(.+)$/, async (ctx) => {
 
   console.log("[game] take", { rid, uid });
 
-  const loaded = await loadRoomGame(ctx, rid);
-  if (!loaded) return;
-  const { room, game: g } = loaded;
+  const room = await loadRoomGame(ctx, rid);
+  if (!room) return;
+  const g = room.game!;
 
   const defender = g.players[g.defender_idx];
   if (!defender) {
@@ -422,34 +524,54 @@ composer.callbackQuery(/^take:(.+)$/, async (ctx) => {
     return;
   }
 
-  for (const pair of g.table) {
-    defender.hand.push(pair.attack);
-    if (pair.defend) defender.hand.push(pair.defend);
-  }
-  const takenCount = g.table.reduce((n, p) => n + 1 + (p.defend ? 1 : 0), 0);
-  g.table = [];
-
   const upTo = initialHandSize(room);
-  for (const p of g.players) {
-    if (p.user_id !== defender.user_id && isPlayerActive(p)) {
-      refillHand(g, p, upTo);
+  const deadline = now() + TURN_TIMEOUT_MS;
+  let updatedRoom: StoredRoom;
+  try {
+    updatedRoom = await updateRoom(rid, (fresh) => {
+      const fg = fresh.game;
+      if (!fg || fg.phase === "ended") throw new GameActionError("Game already ended.");
+      if (fg.phase !== "defend" && fg.phase !== "podkid") {
+        throw new GameActionError("Phase changed — can't take now.");
+      }
+      const fd = fg.players[fg.defender_idx];
+      if (!fd || fd.user_id !== uid) throw new GameActionError("You're no longer the defender.");
+
+      for (const pair of fg.table) {
+        fd.hand.push(pair.attack);
+        if (pair.defend) fd.hand.push(pair.defend);
+      }
+      fg.table = [];
+
+      // Refill other active players — defender doesn't draw
+      for (const p of fg.players) {
+        if (p.user_id !== uid && isPlayerActive(p)) {
+          const needed = Math.max(0, upTo - p.hand.length);
+          if (needed > 0) {
+            const drawn = drawCards(fg, needed);
+            p.hand.push(...drawn);
+          }
+        }
+      }
+
+      fg.phase = "attack";
+      fg.turn_deadline = deadline;
+    });
+  } catch (err) {
+    if (GameActionError.is(err)) {
+      await ctx.reply(err.message);
+      return;
     }
+    throw err;
   }
 
-  // Defender took — they don't get to attack; skip to next player
-  g.phase = "attack";
-  g.turn_deadline = now() + TURN_TIMEOUT_MS;
-
-  console.log("[game] defender took cards", { rid, uid, takenCount });
-
-  await saveRoom(room);
-  scheduleTurnTimer(ctx.api, rid, g.turn_deadline);
-  await broadcastPublicStateApi(ctx.api, g);
-
-  await sendPrivateHandApi(ctx.api, g, defender, rid);
-  for (const p of g.players) {
-    if (p.user_id !== defender.user_id && isPlayerActive(p)) {
-      await sendPrivateHandApi(ctx.api, g, p, rid);
+  const ug = updatedRoom.game!;
+  scheduleTurnTimer(ctx.api, rid, ug.turn_deadline);
+  await broadcastPublicStateApi(ctx.api, ug);
+  await sendPrivateHandApi(ctx.api, ug, ug.players[ug.defender_idx], rid);
+  for (const p of ug.players) {
+    if (p.user_id !== ug.players[ug.defender_idx]?.user_id && isPlayerActive(p)) {
+      await sendPrivateHandApi(ctx.api, ug, p, rid);
     }
   }
 });
@@ -463,9 +585,9 @@ composer.callbackQuery(/^done:(.+)$/, async (ctx) => {
 
   console.log("[game] done", { rid, uid });
 
-  const loaded = await loadRoomGame(ctx, rid);
-  if (!loaded) return;
-  const { room, game: g } = loaded;
+  const room = await loadRoomGame(ctx, rid);
+  if (!room) return;
+  const g = room.game!;
 
   if (g.phase === "attack") {
     if (g.table.length === 0) {
@@ -481,24 +603,41 @@ composer.callbackQuery(/^done:(.+)$/, async (ctx) => {
       return;
     }
 
-    // Attacker done → transition to defend phase
-    g.phase = "defend";
-    g.turn_deadline = now() + TURN_TIMEOUT_MS;
-    console.log("[game] attacker done → defend phase", { rid, tableSize: g.table.length });
-    await saveRoom(room);
-    scheduleTurnTimer(ctx.api, rid, g.turn_deadline);
-    await broadcastPublicStateApi(ctx.api, g);
-    await sendPrivateHandApi(ctx.api, g, g.players[g.defender_idx], rid);
-    for (const p of g.players) {
-      if (p.user_id !== g.players[g.defender_idx]?.user_id && isPlayerActive(p)) {
-        await sendPrivateHandApi(ctx.api, g, p, rid);
+    const deadline = now() + TURN_TIMEOUT_MS;
+    let updatedRoom: StoredRoom;
+    try {
+      updatedRoom = await updateRoom(rid, (fresh) => {
+        const fg = fresh.game;
+        if (!fg || fg.phase === "ended") throw new GameActionError("Game already ended.");
+        if (fg.phase !== "attack") throw new GameActionError("Not the attack phase anymore.");
+        const fa = fg.players[fg.attacker_idx];
+        if (!fa || fa.user_id !== uid) throw new GameActionError("You're no longer the attacker.");
+        if (fg.table.length === 0) throw new GameActionError("Must attack with at least one card.");
+        fg.phase = "defend";
+        fg.turn_deadline = deadline;
+      });
+    } catch (err) {
+      if (GameActionError.is(err)) {
+        await ctx.reply(err.message);
+        return;
+      }
+      throw err;
+    }
+
+    const ug = updatedRoom.game!;
+    console.log("[game] attacker done → defend phase", { rid, tableSize: ug.table.length });
+    scheduleTurnTimer(ctx.api, rid, ug.turn_deadline);
+    await broadcastPublicStateApi(ctx.api, ug);
+    await sendPrivateHandApi(ctx.api, ug, ug.players[ug.defender_idx], rid);
+    for (const p of ug.players) {
+      if (p.user_id !== ug.players[ug.defender_idx]?.user_id && isPlayerActive(p)) {
+        await sendPrivateHandApi(ctx.api, ug, p, rid);
       }
     }
     return;
   }
 
   if (g.phase === "podkid") {
-    // Validate caller: must be an active non-defender player
     const defender = g.players[g.defender_idx];
     const caller = g.players.find((p) => p.user_id === uid);
     if (!caller || caller.status !== "playing") {
@@ -518,64 +657,88 @@ composer.callbackQuery(/^done:(.+)$/, async (ctx) => {
     }
 
     console.log("[game] done in podkid phase → advance turn", { rid, uid });
-    await advanceTurn(ctx.api, g, rid, room);
-    return;
+    return advanceTurn(ctx.api, rid, room);
   }
 
   await ctx.reply("Nothing to finish right now.");
 });
 
+// ---- advance turn (used by done:podkid, podkid timeout, and defend timeout) ----
+
 async function advanceTurn(
   api: Api,
-  g: StoredGameState,
   rid: string,
   room: StoredRoom,
 ): Promise<void> {
   clearGameTimer(rid);
-
-  const beatCount = g.table.reduce((n, p) => n + 1 + (p.defend ? 1 : 0), 0);
-  for (const pair of g.table) {
-    g.discard.push(pair.attack);
-    if (pair.defend) g.discard.push(pair.defend);
-  }
-  g.table = [];
-
   const upTo = initialHandSize(room);
-  const startIdx = g.attacker_idx;
-  for (let i = 0; i < g.players.length; i++) {
-    const p = g.players[(startIdx + i) % g.players.length];
-    if (isPlayerActive(p)) {
-      refillHand(g, p, upTo);
-    }
-  }
+  const deadline = now() + TURN_TIMEOUT_MS;
 
-  if (g.deck.length === 0) {
-    for (const p of g.players) {
-      if (isPlayerActive(p) && p.hand.length === 0) {
-        p.status = "durak";
+  let updatedRoom: StoredRoom;
+  try {
+    updatedRoom = await updateRoom(rid, (fresh) => {
+      const fg = fresh.game;
+      if (!fg || fg.phase === "ended") throw new GameActionError("Game already ended.");
+
+      // Discard all table cards
+      for (const pair of fg.table) {
+        fg.discard.push(pair.attack);
+        if (pair.defend) fg.discard.push(pair.defend);
       }
+      fg.table = [];
+
+      // Refill starting from attacker
+      const startIdx = fg.attacker_idx;
+      for (let i = 0; i < fg.players.length; i++) {
+        const p = fg.players[(startIdx + i) % fg.players.length];
+        if (isPlayerActive(p)) {
+          const needed = Math.max(0, upTo - p.hand.length);
+          if (needed > 0) {
+            const drawn = drawCards(fg, needed);
+            p.hand.push(...drawn);
+          }
+        }
+      }
+
+      // Mark empty-hand players as "out" when deck is exhausted
+      if (fg.deck.length === 0) {
+        for (const p of fg.players) {
+          if (isPlayerActive(p) && p.hand.length === 0) {
+            p.status = "out";
+          }
+        }
+      }
+
+      if (checkGameEnd(fg)) {
+        return;
+      }
+
+      nextAttackerDefender(fg);
+      fg.phase = "attack";
+      fg.turn_deadline = deadline;
+    });
+  } catch (err) {
+    if (GameActionError.is(err)) {
+      return; // game ended or disappeared
     }
+    throw err;
   }
 
-  if (checkGameEnd(g)) {
-    console.log("[game] game ended", { rid, beatCount });
-    await saveRoom(room);
-    await broadcastGameEndApi(api, g);
+  const ug = updatedRoom.game!;
+  if (ug.phase === "ended") {
+    console.log("[game] game ended via advanceTurn", { rid });
+    await broadcastGameEndApi(api, ug);
     return;
   }
 
-  nextAttackerDefender(g);
-  g.phase = "attack";
-  g.turn_deadline = now() + TURN_TIMEOUT_MS;
-  console.log("[game] turn advanced", { rid, newAttacker: g.players[g.attacker_idx]?.telegram_name, beatCount });
+  console.log("[game] turn advanced", { rid, newAttacker: ug.players[ug.attacker_idx]?.telegram_name });
 
-  await saveRoom(room);
-  scheduleTurnTimer(api, rid, g.turn_deadline);
-  await broadcastPublicStateApi(api, g);
+  scheduleTurnTimer(api, rid, ug.turn_deadline);
+  await broadcastPublicStateApi(api, ug);
 
-  for (const p of g.players) {
+  for (const p of ug.players) {
     if (isPlayerActive(p)) {
-      await sendPrivateHandApi(api, g, p, rid);
+      await sendPrivateHandApi(api, ug, p, rid);
     }
   }
 }
@@ -594,83 +757,185 @@ async function handleTurnTimeout(
 
   if (g.phase === "attack") {
     if (g.table.length > 0) {
-      const defender = g.players[g.defender_idx];
-      if (defender) {
-        for (const pair of g.table) {
-          defender.hand.push(pair.attack);
-          if (pair.defend) defender.hand.push(pair.defend);
+      // Attacker timed out with cards on table → transition to defend phase
+      // (mirrors what happens when attacker presses "✅ Done attacking"),
+      // giving the defender a fair chance to defend.
+      const deadline = now() + TURN_TIMEOUT_MS;
+      let updatedRoom: StoredRoom;
+      try {
+        updatedRoom = await updateRoom(rid, (fresh) => {
+          const fg = fresh.game;
+          if (!fg || fg.phase === "ended") throw new GameActionError("Game ended.");
+          if (fg.phase !== "attack") throw new GameActionError("Phase changed.");
+          fg.phase = "defend";
+          fg.turn_deadline = deadline;
+        });
+      } catch (err) {
+        if (GameActionError.is(err)) return;
+        throw err;
+      }
+
+      const ug = updatedRoom.game!;
+      scheduleTurnTimer(api, rid, ug.turn_deadline);
+      await broadcastPublicStateApi(api, ug);
+      await sendPrivateHandApi(api, ug, ug.players[ug.defender_idx], rid);
+      for (const p of ug.players) {
+        if (p.user_id !== ug.players[ug.defender_idx]?.user_id && isPlayerActive(p)) {
+          await sendPrivateHandApi(api, ug, p, rid);
         }
       }
-      g.table = [];
-    }
-    for (const p of g.players) {
-      if (isPlayerActive(p)) refillHand(g, p, upTo);
-    }
-    if (checkGameEnd(g)) {
-      await saveRoom(room);
-      await broadcastGameEndApi(api, g);
-      return;
-    }
-    nextAttackerDefender(g);
-    g.phase = "attack";
-    g.turn_deadline = now() + TURN_TIMEOUT_MS;
-    await saveRoom(room);
-    scheduleTurnTimer(api, rid, g.turn_deadline);
-    await broadcastPublicStateApi(api, g);
-    for (const p of g.players) {
-      if (isPlayerActive(p)) await sendPrivateHandApi(api, g, p, rid);
-    }
-    try {
-      await api.sendMessage(g.players[g.attacker_idx].user_id, "⏰ Turn timed out — auto-passed to next player.");
-    } catch {}
-  } else if (g.phase === "defend") {
-    const defender = g.players[g.defender_idx];
-    if (defender) {
-      for (const pair of g.table) {
-        defender.hand.push(pair.attack);
-        if (pair.defend) defender.hand.push(pair.defend);
+      try {
+        await api.sendMessage(
+          ug.players[ug.attacker_idx].user_id,
+          "⏰ Time's up — your attack passed to the defender.",
+        );
+      } catch {}
+    } else {
+      // Attacker timed out without playing any cards → skip their turn
+      const oldAttackerId = g.players[g.attacker_idx]?.user_id;
+      const deadline = now() + TURN_TIMEOUT_MS;
+      let updatedRoom: StoredRoom;
+      try {
+        updatedRoom = await updateRoom(rid, (fresh) => {
+          const fg = fresh.game;
+          if (!fg || fg.phase === "ended") throw new GameActionError("Game ended.");
+          if (fg.phase !== "attack") throw new GameActionError("Phase changed.");
+          nextAttackerDefender(fg);
+          fg.phase = "attack";
+          fg.turn_deadline = deadline;
+        });
+      } catch (err) {
+        if (GameActionError.is(err)) return;
+        throw err;
       }
+
+      const ug = updatedRoom.game!;
+      scheduleTurnTimer(api, rid, ug.turn_deadline);
+      await broadcastPublicStateApi(api, ug);
+      for (const p of ug.players) {
+        if (isPlayerActive(p)) await sendPrivateHandApi(api, ug, p, rid);
+      }
+      try {
+        if (oldAttackerId) {
+          await api.sendMessage(oldAttackerId, "⏰ Your turn timed out — moving on.");
+        }
+      } catch {}
     }
-    g.table = [];
-    for (const p of g.players) {
-      if (isPlayerActive(p)) refillHand(g, p, upTo);
+  } else if (g.phase === "defend") {
+    // Defender timed out → take all cards
+    const defenderId = g.players[g.defender_idx]?.user_id;
+    const deadline = now() + TURN_TIMEOUT_MS;
+    let updatedRoom: StoredRoom;
+    try {
+      updatedRoom = await updateRoom(rid, (fresh) => {
+        const fg = fresh.game;
+        if (!fg || fg.phase === "ended") throw new GameActionError("Game ended.");
+        if (fg.phase !== "defend") throw new GameActionError("Phase changed.");
+        const fd = fg.players[fg.defender_idx];
+        if (fd) {
+          for (const pair of fg.table) {
+            fd.hand.push(pair.attack);
+            if (pair.defend) fd.hand.push(pair.defend);
+          }
+        }
+        fg.table = [];
+        for (const p of fg.players) {
+          if (isPlayerActive(p)) {
+            const needed = Math.max(0, upTo - p.hand.length);
+            if (needed > 0) {
+              const drawn = drawCards(fg, needed);
+              p.hand.push(...drawn);
+            }
+          }
+        }
+        if (checkGameEnd(fg)) return;
+        nextAttackerDefender(fg);
+        fg.phase = "attack";
+        fg.turn_deadline = deadline;
+      });
+    } catch (err) {
+      if (GameActionError.is(err)) return;
+      throw err;
     }
-    if (checkGameEnd(g)) {
-      await saveRoom(room);
-      await broadcastGameEndApi(api, g);
+
+    const ug = updatedRoom.game!;
+    if (ug.phase === "ended") {
+      await broadcastGameEndApi(api, ug);
       return;
     }
-    nextAttackerDefender(g);
-    g.phase = "attack";
-    g.turn_deadline = now() + TURN_TIMEOUT_MS;
-    await saveRoom(room);
-    scheduleTurnTimer(api, rid, g.turn_deadline);
-    await broadcastPublicStateApi(api, g);
-    for (const p of g.players) {
-      if (isPlayerActive(p)) await sendPrivateHandApi(api, g, p, rid);
+    scheduleTurnTimer(api, rid, ug.turn_deadline);
+    await broadcastPublicStateApi(api, ug);
+    for (const p of ug.players) {
+      if (isPlayerActive(p)) await sendPrivateHandApi(api, ug, p, rid);
     }
     try {
-      if (defender) await api.sendMessage(defender.user_id, "⏰ Time's up — you took all the cards.");
+      if (defenderId) await api.sendMessage(defenderId, "⏰ Time's up — you took all the cards.");
     } catch {}
   } else if (g.phase === "podkid") {
-    const allDefended = g.table.every((p) => p.defend);
-    if (allDefended) {
-      for (const pair of g.table) {
-        g.discard.push(pair.attack);
-        if (pair.defend) g.discard.push(pair.defend);
-      }
-      g.table = [];
-    } else {
-      const defender = g.players[g.defender_idx];
-      if (defender) {
-        for (const pair of g.table) {
-          defender.hand.push(pair.attack);
-          if (pair.defend) defender.hand.push(pair.defend);
+    // Podkid timed out → if all defended, discard; else defender takes
+    let gameEnded = false;
+    let updatedRoom: StoredRoom | null = null;
+    try {
+      updatedRoom = await updateRoom(rid, (fresh) => {
+        const fg = fresh.game;
+        if (!fg || fg.phase === "ended") throw new GameActionError("Game ended.");
+        if (fg.phase !== "podkid") throw new GameActionError("Phase changed.");
+
+        const allDefended = fg.table.every((p) => p.defend);
+        if (allDefended) {
+          for (const pair of fg.table) {
+            fg.discard.push(pair.attack);
+            if (pair.defend) fg.discard.push(pair.defend);
+          }
+          fg.table = [];
+        } else {
+          const fd = fg.players[fg.defender_idx];
+          if (fd) {
+            for (const pair of fg.table) {
+              fd.hand.push(pair.attack);
+              if (pair.defend) fd.hand.push(pair.defend);
+            }
+          }
+          fg.table = [];
         }
-      }
-      g.table = [];
+
+        // Refill + check end + advance
+        for (const p of fg.players) {
+          if (isPlayerActive(p)) {
+            const needed = Math.max(0, upTo - p.hand.length);
+            if (needed > 0) {
+              const drawn = drawCards(fg, needed);
+              p.hand.push(...drawn);
+            }
+          }
+        }
+        if (fg.deck.length === 0) {
+          for (const p of fg.players) {
+            if (isPlayerActive(p) && p.hand.length === 0) p.status = "out";
+          }
+        }
+        if (checkGameEnd(fg)) { gameEnded = true; return; }
+        nextAttackerDefender(fg);
+        fg.phase = "attack";
+        fg.turn_deadline = now() + TURN_TIMEOUT_MS;
+      });
+    } catch (err) {
+      if (GameActionError.is(err)) return;
+      throw err;
     }
-    await advanceTurn(api, g, rid, room);
+
+    if (!updatedRoom) return;
+
+    const ug = updatedRoom.game!;
+    if (gameEnded || ug.phase === "ended") {
+      await broadcastGameEndApi(api, ug);
+      return;
+    }
+    scheduleTurnTimer(api, rid, ug.turn_deadline);
+    await broadcastPublicStateApi(api, ug);
+    for (const p of ug.players) {
+      if (isPlayerActive(p)) await sendPrivateHandApi(api, ug, p, rid);
+    }
   }
 }
 
@@ -729,42 +994,62 @@ async function handleLeaveRoom(ctx: Ctx, rid: string, uid: number): Promise<void
   }
 
   if (room.game && room.game.phase !== "ended") {
-    // Mid-game leave
-    player.status = "left";
+    // Mid-game leave — mark player as left but game continues
     const g = room.game;
-    const gamePlayer = g.players.find((p) => p.user_id === uid);
-    if (gamePlayer) {
-      gamePlayer.status = "left";
+    const isAttacker = g.players[g.attacker_idx]?.user_id === uid;
+    const isDefender = g.players[g.defender_idx]?.user_id === uid;
 
-      const isAttacker = g.players[g.attacker_idx]?.user_id === uid;
-      const isDefender = g.players[g.defender_idx]?.user_id === uid;
+    try {
+      await updateRoom(rid, (fresh) => {
+        const pl = fresh.players.find((p) => p.user_id === uid);
+        if (pl) pl.status = "left";
 
-      if (isAttacker && g.phase === "attack") {
-        if (g.table.length > 0) {
-          await handleTurnTimeout(ctx.api, g, rid, room);
-        } else {
-          nextAttackerDefender(g);
-          g.phase = "attack";
-          g.turn_deadline = now() + TURN_TIMEOUT_MS;
-          await saveRoom(room);
-          scheduleTurnTimer(ctx.api, rid, g.turn_deadline);
-          await broadcastPublicStateApi(ctx.api, g);
-          for (const p of g.players) {
-            if (isPlayerActive(p)) await sendPrivateHandApi(ctx.api, g, p, rid);
-          }
+        if (fresh.game && fresh.game.phase !== "ended") {
+          const gp = fresh.game.players.find((p) => p.user_id === uid);
+          if (gp) gp.status = "left";
         }
-      } else if (isDefender && (g.phase === "defend" || g.phase === "podkid")) {
+      });
+    } catch {
+      // room gone — already handled
+    }
+
+    // Handle turn rotation if leaver was active player
+    if (isAttacker && g.phase === "attack") {
+      if (g.table.length > 0) {
+        // Cards on table → transition to defend for fairness
         await handleTurnTimeout(ctx.api, g, rid, room);
       } else {
-        await saveRoom(room);
-        await broadcastPublicStateApi(ctx.api, g);
+        // No cards → skip attacker, move to next
+        let updatedRoom: StoredRoom;
+        try {
+          updatedRoom = await updateRoom(rid, (fresh) => {
+            const fg = fresh.game;
+            if (!fg || fg.phase === "ended") throw new GameActionError("Game ended.");
+            nextAttackerDefender(fg);
+            fg.phase = "attack";
+            fg.turn_deadline = now() + TURN_TIMEOUT_MS;
+          });
+        } catch (err) {
+          if (GameActionError.is(err)) return;
+          throw err;
+        }
+
+        const ug = updatedRoom.game!;
+        scheduleTurnTimer(ctx.api, rid, ug.turn_deadline);
+        await broadcastPublicStateApi(ctx.api, ug);
+        for (const p of ug.players) {
+          if (isPlayerActive(p)) await sendPrivateHandApi(ctx.api, ug, p, rid);
+        }
       }
+    } else if (isDefender && (g.phase === "defend" || g.phase === "podkid")) {
+      await handleTurnTimeout(ctx.api, g, rid, room);
     } else {
-      await saveRoom(room);
+      await broadcastPublicStateApi(ctx.api, g);
     }
     await ctx.reply("You've left the game. 👋");
   } else {
     // Lobby leave
+    let playerName = player.telegram_name;
     room.players = room.players.filter((p) => p.user_id !== uid);
     if (room.players.length === 0) {
       await deleteRoom(rid);
@@ -775,7 +1060,7 @@ async function handleLeaveRoom(ctx: Ctx, rid: string, uid: number): Promise<void
       await saveRoom(room);
 
       const msg =
-        `🚪 ${player.telegram_name} left the room.\n\n` +
+        `🚪 ${playerName} left the room.\n\n` +
         formatPlayerListLobby(room.players, room.max_players);
       for (const p of room.players) {
         try { await ctx.api.sendMessage(p.user_id, msg); } catch {}
@@ -796,9 +1081,17 @@ composer.callbackQuery(/^game:end:(.+)$/, async (ctx) => {
     return;
   }
   clearGameTimer(rid);
-  room.game.phase = "ended";
-  await saveRoom(room);
-  await broadcastGameEndApi(ctx.api, room.game);
+  let updatedRoom: StoredRoom;
+  try {
+    updatedRoom = await updateRoom(rid, (fresh) => {
+      if (!fresh.game) throw new GameActionError("No game.");
+      fresh.game.phase = "ended";
+    });
+  } catch (err) {
+    if (GameActionError.is(err)) return;
+    throw err;
+  }
+  await broadcastGameEndApi(ctx.api, updatedRoom.game!);
 });
 
 // ---- nop: catch-all for non-playable card taps ----
