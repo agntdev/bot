@@ -8,6 +8,7 @@ import {
   clearUserRoom,
   saveRoom,
   deleteRoom,
+  updateRoom,
 } from "../lib/storage.js";
 import type { StoredPlayer } from "../lib/storage.js";
 
@@ -86,34 +87,42 @@ async function handleJoinDeepLink(ctx: Ctx, rid: string): Promise<void> {
     return;
   }
 
-  const existing = room.players.find((p) => p.user_id === uid);
-  if (existing) {
-    if (existing.status !== "left") {
+  const joinerName = ctx.from!.first_name || "Player";
+  let updatedRoom;
+  try {
+    updatedRoom = await updateRoom(rid, (r) => {
+      const existing = r.players.find((p) => p.user_id === uid);
+      if (existing) {
+        if (existing.status !== "left") {
+          throw new Error("already-in-room");
+        }
+        existing.status = "lobby";
+      } else {
+        r.players.push(makePlayer(uid, joinerName));
+      }
+    });
+  } catch (err) {
+    if (err instanceof Error && err.message === "already-in-room") {
       await ctx.reply("You're already in this room!");
       return;
     }
-    existing.status = "lobby";
-  } else {
-    const name = ctx.from!.first_name || "Player";
-    room.players.push(makePlayer(uid, name));
+    throw err;
   }
 
-  await saveRoom(room);
   await setUserRoom(uid, rid);
 
-  const playerNames = room.players.filter((p) => p.status !== "left").map((p) => p.telegram_name).join(", ");
+  const playerNames = updatedRoom.players.filter((p) => p.status !== "left").map((p) => p.telegram_name).join(", ");
   await ctx.reply(
-    `🚪 Joined room ${rid}!\n\n${playerNames}\n\nPlayers: ${room.players.filter(p => p.status !== "left").length}/${room.max_players}`,
+    `🚪 Joined room ${rid}!\n\n${playerNames}\n\nPlayers: ${updatedRoom.players.filter(p => p.status !== "left").length}/${updatedRoom.max_players}`,
   );
 
   // Notify other players in the room
-  const joinerName = ctx.from!.first_name || "Player";
-  for (const p of room.players) {
+  for (const p of updatedRoom.players) {
     if (p.user_id !== uid && p.status !== "left") {
       try {
         await ctx.api.sendMessage(
           p.user_id,
-          `👋 ${joinerName} joined the room!\n\n${playerNames}\n\nPlayers: ${room.players.filter(p => p.status !== "left").length}/${room.max_players}`,
+          `👋 ${joinerName} joined the room!\n\n${playerNames}\n\nPlayers: ${updatedRoom.players.filter(p => p.status !== "left").length}/${updatedRoom.max_players}`,
         );
       } catch {}
     }

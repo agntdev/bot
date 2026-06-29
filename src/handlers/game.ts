@@ -223,9 +223,17 @@ composer.callbackQuery(/^atk:(.+):(\d+)$/, async (ctx) => {
     }
   }
 
-  // Cap attacks at 6 (defender's max hand size)
-  if (g.table.length >= 6) {
-    await ctx.reply("Max attacks on the table — tap ✅ Done attacking.");
+  // Cap attacks at the defender's current hand size (max 6).
+  // Standard Durak rule: you cannot attack with more cards
+  // than the defender can hold.
+  const defender = g.players[g.defender_idx];
+  const maxAttacks = Math.min(6, defender ? defender.hand.length : 6);
+  if (g.table.length >= maxAttacks) {
+    if (maxAttacks <= 0) {
+      await ctx.reply("The defender has no cards — tap ✅ Done attacking.");
+    } else {
+      await ctx.reply(`Max ${maxAttacks} attack${maxAttacks !== 1 ? "s" : ""} on the table — tap ✅ Done attacking.`);
+    }
     return;
   }
 
@@ -250,7 +258,7 @@ composer.callbackQuery(/^atk:(.+):(\d+)$/, async (ctx) => {
       if (fg.table.length > 0 && !tableRanks(fg.table).has(fa.hand[idx].rank)) {
         throw new GameActionError("That rank can't be played anymore.");
       }
-      if (fg.table.length >= 6) throw new GameActionError("Table is full.");
+      if (fg.table.length >= Math.min(6, fg.players[fg.defender_idx]?.hand.length ?? 6)) throw new GameActionError("Table is full.");
 
       const played = fa.hand.splice(idx, 1)[0];
       fg.table.push({ attack: played });
@@ -319,8 +327,12 @@ composer.callbackQuery(/^def:(.+):(\d+)$/, async (ctx) => {
   const defendCard = defender.hand[idx];
 
   if (!cardBeats(attack, defendCard, g.trump_suit)) {
+    const hint =
+      attack.suit === g.trump_suit
+        ? `Pick a higher trump to beat ${cardToString(attack)}.`
+        : `Pick a higher rank of the same suit (${attack.suit}) or any trump.`;
     await ctx.reply(
-      `${cardToString(defendCard)} can't beat ${cardToString(attack)}. Pick a higher rank of the same suit or a trump.`,
+      `${cardToString(defendCard)} can't beat ${cardToString(attack)}. ${hint}`,
     );
     return;
   }
@@ -435,7 +447,7 @@ async function handlePodkid(
       if (!tableRanks(fg.table).has(fp.hand[idx].rank)) {
         throw new GameActionError("That rank can't be tossed in anymore.");
       }
-      if (fg.table.length >= 6) throw new GameActionError("Table is full.");
+      if (fg.table.length >= Math.min(6, fg.players[fg.defender_idx]?.hand.length ?? 6)) throw new GameActionError("Table is full.");
 
       const pc = fp.hand.splice(idx, 1)[0];
       fg.table.push({ attack: pc });
@@ -1048,21 +1060,27 @@ async function handleLeaveRoom(ctx: Ctx, rid: string, uid: number): Promise<void
     }
     await ctx.reply("You've left the game. 👋");
   } else {
-    // Lobby leave
-    let playerName = player.telegram_name;
-    room.players = room.players.filter((p) => p.user_id !== uid);
-    if (room.players.length === 0) {
+    // Lobby leave — use updateRoom for atomicity
+    const playerName = player.telegram_name;
+    try {
+      await updateRoom(rid, (r) => {
+        r.players = r.players.filter((p) => p.user_id !== uid);
+        if (r.players.length > 0 && r.host_id === uid) {
+          r.host_id = r.players[0].user_id;
+        }
+      });
+    } catch {
+      // room already deleted or gone
+    }
+
+    const updatedRoom = await readRoom(rid);
+    if (!updatedRoom || updatedRoom.players.length === 0) {
       await deleteRoom(rid);
     } else {
-      if (room.host_id === uid && room.players.length > 0) {
-        room.host_id = room.players[0].user_id;
-      }
-      await saveRoom(room);
-
       const msg =
         `🚪 ${playerName} left the room.\n\n` +
-        formatPlayerListLobby(room.players, room.max_players);
-      for (const p of room.players) {
+        formatPlayerListLobby(updatedRoom.players, updatedRoom.max_players);
+      for (const p of updatedRoom.players) {
         try { await ctx.api.sendMessage(p.user_id, msg); } catch {}
       }
     }
