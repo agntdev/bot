@@ -2,6 +2,7 @@ import { Composer } from "grammy";
 import type { Ctx } from "../bot.js";
 import { registerMainMenuItem, inlineButton, inlineKeyboard } from "../toolkit/index.js";
 import { MemorySessionStorage } from "../toolkit/session/memory.js";
+import { randomBytes } from "node:crypto";
 
 registerMainMenuItem({ label: "🎮 Create", data: "room:create", order: 10 });
 registerMainMenuItem({ label: "🚪 Join", data: "room:join", order: 20 });
@@ -36,7 +37,7 @@ const roomStore = new MemorySessionStorage<Room>();
 const userRoomStore = new MemorySessionStorage<string>(); // userId -> rid simple index
 
 function genRoomId(): string {
-  return Math.random().toString(36).slice(2, 8).toUpperCase();
+  return randomBytes(3).toString("hex").toUpperCase();
 }
 
 const RANKS = ["6", "7", "8", "9", "10", "J", "Q", "K", "A"];
@@ -61,7 +62,7 @@ composer.callbackQuery("room:create", async (ctx) => {
   };
   await roomStore.write(rid, room);
   await userRoomStore.write(String(uid), rid);
-  const msg = `Room ${rid} created! Share this link to invite friends:\n${link}\n\nPlayers: 1/6\nTap Start when ready.`;
+  const msg = `Room ${rid} created! Defaults: max 6 players, hand 6. Share link:\n${link}\n\nPlayers: 1/6\nTap Start when ready.`;
   await ctx.reply(msg, {
     reply_markup: inlineKeyboard([
       [inlineButton("▶️ Start Game", `game:start:${rid}`)],
@@ -116,8 +117,10 @@ composer.callbackQuery(/^game:start:(.+)$/, async (ctx) => {
     `Game started in ${rid}! Trump: ${trump_card.rank}${trump_suit}\nAttacker: ${room.players[0].telegram_name}`,
     { reply_markup: inlineKeyboard([[inlineButton("My Hand", "hand:show")], [inlineButton("⬅️ Back", "menu:main")]]) }
   );
-  // private hand for first attacker
-  await ctx.api.sendMessage(room.players[0].user_id, `Your hand: ${game.players[0].hand.map(c => c.rank + c.suit).join(" ")}`);
+  // private hand for ALL players
+  for (const pl of game.players) {
+    await ctx.api.sendMessage(pl.user_id, `Your hand: ${pl.hand.map(c => c.rank + c.suit).join(" ")}`);
+  }
 });
 
 composer.callbackQuery("room:join", async (ctx) => {
@@ -200,13 +203,15 @@ composer.callbackQuery(/^attack:card:(.+):(\d+)$/, async (ctx) => {
   if (g.players[g.attacker_idx].user_id !== uid || g.phase !== "attack") return ctx.reply("Not your attack turn.");
   const p = g.players[g.attacker_idx];
   if (!p.hand[idx]) return;
-  const card = p.hand.splice(idx, 1)[0];
+  const card = p.hand[idx];
+  const ranksOnTable = g.table.flatMap(t => [t.attack.rank]);
+  if (ranksOnTable.length && !ranksOnTable.includes(card.rank)) { await ctx.reply("Rank must match cards on table."); return; }
+  p.hand.splice(idx, 1);
   g.table.push({ attack: card });
   g.phase = "defend";
   g.turn_deadline = Date.now() + 60000;
   await roomStore.write(rid, room);
   await ctx.reply(`Attacked with ${card.rank}${card.suit}. Public update sent.`);
-  // public state sync omitted for brevity (edit lobby msg in real), private too
 });
 
 composer.callbackQuery(/^defend:card:(.+):(\d+)$/, async (ctx) => {
@@ -217,19 +222,54 @@ composer.callbackQuery(/^defend:card:(.+):(\d+)$/, async (ctx) => {
   if (Date.now() > g.turn_deadline) { /* auto */ return; }
   const uid = ctx.from!.id;
   if (g.players[g.defender_idx].user_id !== uid || g.phase !== "defend") return ctx.reply("Not your defend.");
-  // etc... minimal valid slice: accept any
-  await ctx.reply("Defended — table updated.");
+  const p = g.players[g.defender_idx];
+  if (!p.hand[idx]) return;
+  const attackCard = g.table[g.table.length-1]?.attack;
+  if (!attackCard) return;
+  const card = p.hand[idx];
+  if (!cardBeats(attackCard, card, g.trump_suit)) { await ctx.reply("That card doesn't beat it — pick a stronger one."); return; }
+  p.hand.splice(idx,1);
+  g.table[g.table.length-1].defend = card;
+  g.phase = "podkid";
+  g.turn_deadline = Date.now() + 60000;
+  await roomStore.write(rid, room);
+  await ctx.reply(`Defended with ${card.rank}${card.suit}.`);
 });
 
 composer.callbackQuery(/^podkid:card:(.+):(\d+)$/, async (ctx) => {
   await ctx.answerCallbackQuery();
-  await ctx.reply("Podkid accepted.");
+  const rid = ctx.match![1]; const idx = parseInt(ctx.match![2]);
+  const room = await roomStore.read(rid); if (!room || !room.game) return;
+  const g = room.game;
+  const uid = ctx.from!.id;
+  // simple podkid check: any player not attacker/defender can podkid if ranks match table
+  if (g.phase !== "podkid" && g.phase !== "attack") return ctx.reply("Not podkid phase.");
+  const pIdx = g.players.findIndex((x) => x.user_id === uid);
+  if (pIdx < 0 || pIdx === g.attacker_idx || pIdx === g.defender_idx) return ctx.reply("Not eligible.");
+  const p = g.players[pIdx];
+  if (!p.hand[idx]) return;
+  // rank match validation for podkid
+  const ranksOnTable = g.table.flatMap(t => [t.attack.rank, t.defend?.rank].filter(Boolean));
+  if (ranksOnTable.length && !ranksOnTable.includes(p.hand[idx].rank)) return ctx.reply("Rank must match table.");
+  const card = p.hand.splice(idx,1)[0];
+  g.table.push({ attack: card });
+  await roomStore.write(rid, room);
+  await ctx.reply(`Podkided ${card.rank}${card.suit}.`);
 });
 
 composer.callbackQuery("game:end", async (ctx) => {
   await ctx.answerCallbackQuery();
-  // check elim logic minimal
-  await ctx.reply("Game ended — дурак declared (fewer than 2 remain).");
+  const rid = (ctx.session as any).currentRoom;
+  if (!rid) { await ctx.reply("No room."); return; }
+  const room = await roomStore.read(rid); if (!room || !room.game) return;
+  const g = room.game;
+  const active = g.players.filter(p => p.hand.length > 0);
+  if (active.length < 2) {
+    const durak = g.players.find(p => p.hand.length > 0);
+    await ctx.reply(`Game over! Дурак: ${durak?.telegram_name || "unknown"}`);
+  } else {
+    await ctx.reply("Game continues.");
+  }
 });
 
 export default composer;
