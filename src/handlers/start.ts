@@ -11,7 +11,15 @@ const composer = new Composer<Ctx>();
 
 const WELCOME = "👋 Welcome! Tap a button below to get started.";
 
-composer.command("start", async (ctx) => {
+composer.command("start", async (ctx, next) => {
+  if (ctx.match && typeof ctx.match === "string" && ctx.match.startsWith("join_")) {
+    ctx.session.step = "awaiting_join_link";
+    // simulate join link processing by reusing text logic
+    const fakeText = ctx.match;
+    // fallthrough to next which may include room handler
+    await next();
+    return;
+  }
   await ctx.reply(WELCOME, { reply_markup: mainMenuKeyboard() });
 });
 
