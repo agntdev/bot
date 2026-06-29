@@ -22,7 +22,7 @@ export function publicStateText(g: StoredGameState): string {
     `Trump: ${g.trump_card.rank}${g.trump_suit}   ${deckInfo}\n\n` +
     `Table:\n${tableStr}\n\n` +
     `${phaseLabel}: ${attacker} → ${defender}\n\n` +
-    `Players: ${g.players.map((p) => p.telegram_name + (p.status === "durak" ? " 💀" : "") + (p.hand.length ? ` (${p.hand.length})` : "")).join(", ")}`
+    `Players: ${g.players.map((p) => p.telegram_name + (p.status === "durak" ? " 💀" : p.status === "out" ? " ✅" : "") + (p.hand.length ? ` (${p.hand.length})` : "")).join(", ")}`
   );
 }
 
@@ -131,7 +131,7 @@ export async function sendPrivateHandApi(
 export async function broadcastPublicStateApi(api: Api, game: StoredGameState): Promise<void> {
   const text = publicStateText(game);
   for (const p of game.players) {
-    if (p.status === "left" || p.status === "durak") continue;
+    if (p.status === "left" || p.status === "durak" || p.status === "out") continue;
     try {
       await api.sendMessage(p.user_id, text);
     } catch {
@@ -145,11 +145,18 @@ export async function broadcastGameEndApi(api: Api, g: StoredGameState): Promise
   clearGameTimer(g.room_id);
   const durak = g.players.find((p) => p.status === "durak");
   const durakName = durak ? durak.telegram_name : "Unknown";
+
+  function standing(p: typeof g.players[number]): string {
+    if (p.status === "durak") return "💀 дурак (loser)";
+    if (p.status === "out") return "🏆 finished";
+    return `${p.hand.length} card${p.hand.length !== 1 ? "s" : ""}`;
+  }
+
   const text =
     `🏁 Game over!\n\n` +
     `${durakName} is the durak! 👑💀\n\n` +
     `Final standings:\n` +
-    g.players.map((p) => `${p.telegram_name} — ${p.status === "durak" ? "💀 дурак" : `${p.hand.length} card${p.hand.length !== 1 ? "s" : ""}`}`).join("\n");
+    g.players.map((p) => `${p.telegram_name} — ${standing(p)}`).join("\n");
 
   console.log("[game] broadcasting game end", { roomId: g.room_id, durakName });
 
