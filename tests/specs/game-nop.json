@@ -1,0 +1,13 @@
+[
+  {
+    "name": "nop callback is answered so spinner doesn't hang",
+    "steps": [
+      {
+        "send": { "callback": "nop:TEST01" },
+        "expect": [
+          { "method": "answerCallbackQuery" }
+        ]
+      }
+    ]
+  }
+]

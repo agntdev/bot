@@ -1,0 +1,13 @@
+[
+  {
+    "name": "/hand command in a game shows private hand",
+    "steps": [
+      {
+        "send": { "text": "/hand" },
+        "expect": [
+          { "method": "sendMessage" }
+        ]
+      }
+    ]
+  }
+]

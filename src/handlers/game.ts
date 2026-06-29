@@ -76,59 +76,150 @@ function isPlayerActive(p: StoredPlayer): boolean {
   return p.status === "playing";
 }
 
+// ---- defensive helpers ----
+
+interface LoadedRoom {
+  room: StoredRoom;
+  game: StoredGameState;
+}
+
+/**
+ * Load a room and its game with a full set of defensive checks.
+ * Returns null + sends an error to the user if anything is wrong.
+ * This centralises the boilerplate so every handler doesn't repeat it.
+ */
+async function loadRoomGame(
+  ctx: Ctx,
+  rid: string,
+): Promise<LoadedRoom | null> {
+  const room = await readRoom(rid);
+  if (!room) {
+    console.warn("[game] room not found", { rid, userId: ctx.from?.id });
+    try { await ctx.reply("Room not found — it may have been closed."); } catch {}
+    return null;
+  }
+  if (!room.game) {
+    console.warn("[game] no game in room", { rid });
+    try { await ctx.reply("No game in progress — wait for the host to start."); } catch {}
+    return null;
+  }
+  if (room.game.phase === "ended") {
+    try { await ctx.reply("That game's already over!"); } catch {}
+    return null;
+  }
+  return { room, game: room.game };
+}
+
+/**
+ * Check turn expiry. Returns null + handles timeout if game is stale.
+ */
+async function checkTurnDeadline(
+  ctx: Ctx,
+  g: StoredGameState,
+  rid: string,
+  room: StoredRoom,
+): Promise<boolean> {
+  if (now() > g.turn_deadline) {
+    console.warn("[game] turn expired on handler entry", { rid, phase: g.phase });
+    try { await ctx.reply("⏰ This turn's timed out — the game moved on."); } catch {}
+    // Trigger timeout so the game advances
+    await handleTurnTimeout(ctx, g, rid, room);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Validate card index is in bounds. Returns null + ephemeral error if not.
+ */
+function validateCardIndex(
+  ctx: Ctx,
+  player: StoredPlayer,
+  idx: number,
+): boolean {
+  if (!player.hand[idx]) {
+    console.warn("[game] card index out of bounds", {
+      userId: player.user_id,
+      idx,
+      handSize: player.hand.length,
+    });
+    try {
+      ctx.answerCallbackQuery({ text: "That card isn't in your hand.", show_alert: false });
+    } catch {}
+    return false;
+  }
+  return true;
+}
+
 // ---- attack:card callback ----
 
 composer.callbackQuery(/^atk:(.+):(\d+)$/, async (ctx) => {
   await ctx.answerCallbackQuery();
   const rid = ctx.match![1];
   const idx = parseInt(ctx.match![2], 10);
-  const room = await readRoom(rid);
-  if (!room?.game) return;
-  const g = room.game;
   const uid = ctx.from!.id;
 
-  if (now() > g.turn_deadline) {
-    await ctx.reply("⏰ This turn's timed out — the game moved on.");
+  console.log("[game] attack:card", { rid, idx, uid });
+
+  const loaded = await loadRoomGame(ctx, rid);
+  if (!loaded) return;
+  const { room, game: g } = loaded;
+
+  // Defensive: turn deadline
+  if (!(await checkTurnDeadline(ctx, g, rid, room))) return;
+
+  // Defensive: valid attacker index
+  const attacker = g.players[g.attacker_idx];
+  if (!attacker) {
+    console.error("[game] invalid attacker_idx", { rid, attacker_idx: g.attacker_idx });
+    await ctx.reply("Something's wrong with the game state — ask the host to restart.");
     return;
   }
 
-  const attacker = g.players[g.attacker_idx];
+  // Defensive: user is the attacker
   if (attacker.user_id !== uid) {
-    // Podkid phase: non-defender can podkid
-    if (g.phase !== "podkid" || g.players[g.defender_idx].user_id === uid) {
-      await ctx.reply("Not your turn to attack.");
-      return;
+    console.warn("[game] non-attacker tapped attack card", {
+      rid, uid, attackerId: attacker.user_id, phase: g.phase,
+    });
+    // Could be a podkid attempt — forward it
+    if (g.phase === "podkid" && g.players[g.defender_idx]?.user_id !== uid) {
+      return handlePodkid(ctx, g, rid, uid, idx, room);
     }
-    return handlePodkid(ctx, g, rid, uid, idx, room);
+    await ctx.answerCallbackQuery({ text: "Not your turn to attack.", show_alert: true });
+    return;
   }
 
+  // Defensive: correct phase
   if (g.phase !== "attack") {
     await ctx.reply("Not the attack phase right now.");
     return;
   }
 
-  const player = g.players[g.attacker_idx];
-  if (!player.hand[idx]) {
-    await ctx.reply("That card isn't in your hand.");
-    return;
-  }
+  // Defensive: card index in bounds
+  if (!validateCardIndex(ctx, attacker, idx)) return;
 
+  // Defensive: rank matching rule check
   if (g.table.length > 0) {
     const ranks = tableRanks(g.table);
-    if (!ranks.has(player.hand[idx].rank)) {
+    if (!ranks.has(attacker.hand[idx].rank)) {
       await ctx.reply("You can only play a card matching a rank already on the table.");
       return;
     }
   }
 
-  const card = player.hand.splice(idx, 1)[0];
+  // ---- Atomically mutate state ----
+  const card = attacker.hand.splice(idx, 1)[0];
   g.table.push({ attack: card });
   g.phase = "defend";
   g.turn_deadline = now() + TURN_TIMEOUT_MS;
 
+  console.log("[game] attack played", {
+    rid, uid, card: cardToString(card), tableSize: g.table.length,
+  });
+
   await saveRoom(room);
   await broadcastPublicState(ctx, g);
-  await sendPrivateHand(ctx, g, player, rid);
+  await sendPrivateHand(ctx, g, attacker, rid);
   await sendPrivateHand(ctx, g, g.players[g.defender_idx], rid);
 });
 
@@ -138,32 +229,44 @@ composer.callbackQuery(/^def:(.+):(\d+)$/, async (ctx) => {
   await ctx.answerCallbackQuery();
   const rid = ctx.match![1];
   const idx = parseInt(ctx.match![2], 10);
-  const room = await readRoom(rid);
-  if (!room?.game) return;
-  const g = room.game;
   const uid = ctx.from!.id;
 
-  if (now() > g.turn_deadline) {
-    await ctx.reply("⏰ This turn's timed out.");
-    return;
-  }
+  console.log("[game] defend:card", { rid, idx, uid });
 
+  const loaded = await loadRoomGame(ctx, rid);
+  if (!loaded) return;
+  const { room, game: g } = loaded;
+
+  // Defensive: turn deadline
+  if (!(await checkTurnDeadline(ctx, g, rid, room))) return;
+
+  // Defensive: valid defender index
   const defender = g.players[g.defender_idx];
-  if (defender.user_id !== uid) {
-    await ctx.reply("Not your turn to defend.");
+  if (!defender) {
+    console.error("[game] invalid defender_idx", { rid, defender_idx: g.defender_idx });
+    await ctx.reply("Something's wrong with the game state — ask the host to restart.");
     return;
   }
 
+  // Defensive: user is the defender
+  if (defender.user_id !== uid) {
+    console.warn("[game] non-defender tapped defend card", {
+      rid, uid, defenderId: defender.user_id, phase: g.phase,
+    });
+    await ctx.answerCallbackQuery({ text: "Not your turn to defend.", show_alert: true });
+    return;
+  }
+
+  // Defensive: correct phase
   if (g.phase !== "defend") {
     await ctx.reply("Not the defend phase right now.");
     return;
   }
 
-  if (!defender.hand[idx]) {
-    await ctx.reply("That card isn't in your hand.");
-    return;
-  }
+  // Defensive: card index in bounds
+  if (!validateCardIndex(ctx, defender, idx)) return;
 
+  // Defensive: there's an undefended attack
   const undefendedIdx = g.table.findIndex((p) => !p.defend);
   if (undefendedIdx === -1) {
     await ctx.reply("All attacks are covered — tap Done or toss in more cards.");
@@ -173,6 +276,7 @@ composer.callbackQuery(/^def:(.+):(\d+)$/, async (ctx) => {
   const attack = g.table[undefendedIdx].attack;
   const defendCard = defender.hand[idx];
 
+  // Defensive: card beats check
   if (!cardBeats(attack, defendCard, g.trump_suit)) {
     await ctx.reply(
       `${cardToString(defendCard)} can't beat ${cardToString(attack)}. Pick a higher rank of the same suit or a trump.`,
@@ -180,8 +284,13 @@ composer.callbackQuery(/^def:(.+):(\d+)$/, async (ctx) => {
     return;
   }
 
+  // ---- Atomically mutate state ----
   defender.hand.splice(idx, 1);
   g.table[undefendedIdx].defend = defendCard;
+
+  console.log("[game] defended", {
+    rid, uid, defendCard: cardToString(defendCard), vs: cardToString(attack),
+  });
 
   const allDefended = g.table.every((p) => p.defend);
   if (allDefended) {
@@ -205,24 +314,39 @@ async function handlePodkid(
   room: StoredRoom,
 ): Promise<void> {
   const player = g.players.find((p) => p.user_id === uid);
-  if (!player || !player.hand[idx]) {
-    await ctx.reply("That card isn't in your hand.");
+  if (!player || player.status !== "playing") {
+    console.warn("[game] podkid by non-playing user", { rid, uid });
+    await ctx.answerCallbackQuery({ text: "You're not playing in this game.", show_alert: true });
     return;
   }
 
+  // Defensive: card index in bounds
+  if (!player.hand[idx]) {
+    console.warn("[game] podkid card index out of bounds", { rid, uid, idx, handSize: player.hand.length });
+    await ctx.answerCallbackQuery({ text: "That card isn't in your hand.", show_alert: false });
+    return;
+  }
+
+  // Defensive: rank matching
   const ranks = tableRanks(g.table);
   if (!ranks.has(player.hand[idx].rank)) {
-    await ctx.reply("You can only toss in a card matching a rank already on the table.");
+    await ctx.answerCallbackQuery({ text: "You can only toss in a card matching a rank already on the table.", show_alert: true });
     return;
   }
 
+  // Defender can handle at most 6 attacks (initial hand size)
   if (g.table.length >= 6) {
-    await ctx.reply("Max attacks on the table already — tap Done.");
+    await ctx.answerCallbackQuery({ text: "Max attacks on the table already — tap Done.", show_alert: true });
     return;
   }
 
+  // ---- Atomically mutate state ----
   const card = player.hand.splice(idx, 1)[0];
   g.table.push({ attack: card });
+
+  console.log("[game] podkid card", {
+    rid, uid, card: cardToString(card), tableSize: g.table.length,
+  });
 
   await saveRoom(room);
   await broadcastPublicState(ctx, g);
@@ -236,22 +360,33 @@ composer.callbackQuery(/^pod:(.+):(\d+)$/, async (ctx) => {
   await ctx.answerCallbackQuery();
   const rid = ctx.match![1];
   const idx = parseInt(ctx.match![2], 10);
-  const room = await readRoom(rid);
-  if (!room?.game) return;
-  const g = room.game;
   const uid = ctx.from!.id;
 
-  if (now() > g.turn_deadline) {
-    await ctx.reply("⏰ This turn's timed out.");
+  console.log("[game] podkid:card", { rid, idx, uid });
+
+  const loaded = await loadRoomGame(ctx, rid);
+  if (!loaded) return;
+  const { room, game: g } = loaded;
+
+  // Defensive: turn deadline
+  if (!(await checkTurnDeadline(ctx, g, rid, room))) return;
+
+  // Defensive: valid defender index
+  const defender = g.players[g.defender_idx];
+  if (!defender) {
+    console.error("[game] invalid defender_idx in podkid", { rid });
+    await ctx.reply("Something's wrong with the game state.");
     return;
   }
 
+  // Defensive: correct phase
   if (g.phase !== "podkid") {
     await ctx.reply("Not the podkid phase right now.");
     return;
   }
 
-  if (g.players[g.defender_idx].user_id === uid) {
+  // Defensive: defender can't podkid
+  if (defender.user_id === uid) {
     await ctx.reply("Defender can't toss cards in — only defend or take.");
     return;
   }
@@ -264,26 +399,41 @@ composer.callbackQuery(/^pod:(.+):(\d+)$/, async (ctx) => {
 composer.callbackQuery(/^take:(.+)$/, async (ctx) => {
   await ctx.answerCallbackQuery();
   const rid = ctx.match![1];
-  const room = await readRoom(rid);
-  if (!room?.game) return;
-  const g = room.game;
   const uid = ctx.from!.id;
 
-  if (g.players[g.defender_idx].user_id !== uid) {
-    await ctx.reply("Only the defender can take.");
+  console.log("[game] take", { rid, uid });
+
+  const loaded = await loadRoomGame(ctx, rid);
+  if (!loaded) return;
+  const { room, game: g } = loaded;
+
+  // Defensive: valid defender index
+  const defender = g.players[g.defender_idx];
+  if (!defender) {
+    console.error("[game] invalid defender_idx in take", { rid });
+    await ctx.reply("Something's wrong with the game state.");
     return;
   }
 
+  // Defensive: user is the defender
+  if (defender.user_id !== uid) {
+    console.warn("[game] non-defender tried to take", { rid, uid, defenderId: defender.user_id });
+    await ctx.answerCallbackQuery({ text: "Only the defender can take cards.", show_alert: true });
+    return;
+  }
+
+  // Defensive: correct phase
   if (g.phase !== "defend" && g.phase !== "podkid") {
     await ctx.reply("Not the right phase to take cards.");
     return;
   }
 
-  const defender = g.players[g.defender_idx];
+  // ---- Atomically mutate state ----
   for (const pair of g.table) {
     defender.hand.push(pair.attack);
     if (pair.defend) defender.hand.push(pair.defend);
   }
+  const takenCount = g.table.reduce((n, p) => n + 1 + (p.defend ? 1 : 0), 0);
   g.table = [];
 
   // Refill all non-defender players to hand size
@@ -294,8 +444,11 @@ composer.callbackQuery(/^take:(.+)$/, async (ctx) => {
     }
   }
 
+  // Skip the attacker's turn (defender took — they don't advance to attack)
   g.phase = "attack";
   g.turn_deadline = now() + TURN_TIMEOUT_MS;
+
+  console.log("[game] defender took cards", { rid, uid, takenCount });
 
   await saveRoom(room);
   await broadcastPublicState(ctx, g);
@@ -313,18 +466,23 @@ composer.callbackQuery(/^take:(.+)$/, async (ctx) => {
 composer.callbackQuery(/^done:(.+)$/, async (ctx) => {
   await ctx.answerCallbackQuery();
   const rid = ctx.match![1];
-  const room = await readRoom(rid);
-  if (!room?.game) return;
-  const g = room.game;
   const uid = ctx.from!.id;
+
+  console.log("[game] done", { rid, uid });
+
+  const loaded = await loadRoomGame(ctx, rid);
+  if (!loaded) return;
+  const { room, game: g } = loaded;
 
   if (g.phase === "attack") {
     if (g.table.length === 0) {
       await ctx.reply("You have to play at least one card first.");
       return;
     }
-    if (g.players[g.attacker_idx].user_id !== uid) {
-      await ctx.reply("Only the current attacker can finish their turn.");
+    const attacker = g.players[g.attacker_idx];
+    if (!attacker || attacker.user_id !== uid) {
+      console.warn("[game] non-attacker tried done in attack phase", { rid, uid, attackerId: attacker?.user_id });
+      await ctx.answerCallbackQuery({ text: "Only the current attacker can finish.", show_alert: true });
       return;
     }
 
@@ -332,10 +490,11 @@ composer.callbackQuery(/^done:(.+)$/, async (ctx) => {
     if (anyUndefended) {
       g.phase = "podkid";
       g.turn_deadline = now() + TURN_TIMEOUT_MS;
+      console.log("[game] attacker done → podkid phase", { rid });
       await saveRoom(room);
       await broadcastPublicState(ctx, g);
       for (const p of g.players) {
-        if (p.user_id !== g.players[g.defender_idx].user_id && isPlayerActive(p)) {
+        if (p.user_id !== g.players[g.defender_idx]?.user_id && isPlayerActive(p)) {
           await sendPrivateHand(ctx, g, p, rid);
         }
       }
@@ -353,6 +512,7 @@ composer.callbackQuery(/^done:(.+)$/, async (ctx) => {
       return;
     }
 
+    console.log("[game] done in podkid phase → advance turn", { rid, uid });
     await advanceTurn(ctx, g, rid, room);
     return;
   }
@@ -366,6 +526,7 @@ async function advanceTurn(
   rid: string,
   room: StoredRoom,
 ): Promise<void> {
+  const beatCount = g.table.reduce((n, p) => n + 1 + (p.defend ? 1 : 0), 0);
   for (const pair of g.table) {
     g.discard.push(pair.attack);
     if (pair.defend) g.discard.push(pair.defend);
@@ -390,14 +551,18 @@ async function advanceTurn(
   }
 
   if (checkGameEnd(g)) {
+    console.log("[game] game ended", { rid, beatCount });
     await saveRoom(room);
     await broadcastGameEnd(ctx, g);
     return;
   }
 
+  const oldAttacker = g.players[g.attacker_idx]?.telegram_name;
   nextAttackerDefender(g);
   g.phase = "attack";
   g.turn_deadline = now() + TURN_TIMEOUT_MS;
+  console.log("[game] turn advanced", { rid, newAttacker: g.players[g.attacker_idx]?.telegram_name, beatCount });
+
   await saveRoom(room);
   await broadcastPublicState(ctx, g);
 
@@ -416,6 +581,8 @@ async function broadcastGameEnd(ctx: Ctx, g: StoredGameState): Promise<void> {
     `${durakName} is the durak! 👑💀\n\n` +
     `Final standings:\n` +
     g.players.map((p) => `${p.telegram_name} — ${p.status === "durak" ? "💀 дурак" : `${p.hand.length} card${p.hand.length !== 1 ? "s" : ""}`}`).join("\n");
+
+  console.log("[game] broadcasting game end", { roomId: g.room_id, durakName });
 
   for (const p of g.players) {
     if (p.status === "left") continue;
