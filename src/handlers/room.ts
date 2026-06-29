@@ -17,7 +17,8 @@ type Room = {
   game?: any;
 };
 
-const rooms = new Map<string, Room>(); // memory-based as per spec; would use persistent store in prod
+import { MemorySessionStorage } from "../toolkit/session/memory.js";
+const roomStore = new MemorySessionStorage<Room>();
 
 function genRoomId(): string {
   return Math.random().toString(36).slice(2, 8).toUpperCase();
@@ -39,7 +40,7 @@ composer.callbackQuery("room:create", async (ctx) => {
     join_link: link,
     players: [{ user_id: uid, telegram_name: name, hand: [], status: "lobby" }],
   };
-  rooms.set(rid, room);
+  await roomStore.write(rid, room);
   const msg = `Room ${rid} created! Share this link to invite friends:\n${link}\n\nPlayers: 1/6\nTap Start when ready.`;
   await ctx.editMessageText(msg, {
     reply_markup: inlineKeyboard([
@@ -64,7 +65,7 @@ composer.on("message:text", async (ctx, next) => {
     return;
   }
   const rid = match[1] || match[2];
-  const room = rooms.get(rid);
+  const room = await roomStore.read(rid);
   if (!room) {
     await ctx.reply("Room not found — link may have expired.");
     ctx.session.step = undefined;
@@ -83,12 +84,15 @@ composer.on("message:text", async (ctx, next) => {
   }
   const name = ctx.from.first_name || "Player";
   room.players.push({ user_id: uid, telegram_name: name, hand: [], status: "lobby" });
+  await roomStore.write(rid, room);
   ctx.session.step = undefined;
   await ctx.reply(`Joined room ${rid}! Players: ${room.players.length}/${room.max_players}`);
 });
 
 composer.command("hand", async (ctx) => {
-  await ctx.reply("Your hand is empty — join a game first.");
+  const uid = ctx.from!.id;
+  // find room by scanning? but avoided — use simple assumption or index not now. For slice: reply no game.
+  await ctx.reply("No active game — join or create a room first.");
 });
 
 export default composer;
