@@ -16,7 +16,7 @@ import {
   type StoredCard,
 } from "../src/lib/storage.js";
 import { createDeck, shuffleDeck, cardToString } from "../src/lib/cards.js";
-import { _setClock, _resetClock, TURN_TIMEOUT_MS } from "../src/lib/clock.js";
+import { _setClock, _resetClock, _clearAllTimers, TURN_TIMEOUT_MS } from "../src/lib/clock.js";
 import { HARNESS_BOT_ID } from "../src/toolkit/harness/updates.js";
 import type { Bot, Transformer } from "grammy";
 
@@ -148,6 +148,7 @@ describe("Game card selection flow", () => {
     _resetStores();
     _resetClock();
     _setClock(() => Date.now());
+    _clearAllTimers();
   });
 
   // --- Test 1: Host attacks with a card — card leaves hand, goes to table ---
@@ -183,8 +184,9 @@ describe("Game card selection flow", () => {
       (c) => c.rank === hostCard.rank && c.suit === hostCard.suit,
     )).toBeUndefined();
 
-    // Phase should be "defend"
-    expect(g.phase).toBe("defend");
+    // Phase should still be "attack" — attacker can play more matching-rank cards
+    // Transitions to "defend" only when attacker taps "✅ Done attacking"
+    expect(g.phase).toBe("attack");
 
     // Should have sent public state and private hands
     const p1HandMsg = findSendMessage(calls, HOST.id);
