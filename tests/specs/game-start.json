@@ -1,9 +1,9 @@
 [
   {
-    "name": "room create shows menu button and invite link",
+    "name": "game start needs at least 2 players",
     "steps": [
       {
-        "send": { "callback": "room:create" },
+        "send": { "callback": "game:start:TEST01" },
         "expect": [
           { "method": "answerCallbackQuery" },
           { "method": "sendMessage" }

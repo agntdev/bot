@@ -1,6 +1,6 @@
 [
   {
-    "name": "room create shows menu button and invite link",
+    "name": "room create button creates a room",
     "steps": [
       {
         "send": { "callback": "room:create" },

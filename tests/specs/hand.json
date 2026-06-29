@@ -1,0 +1,13 @@
+[
+  {
+    "name": "/hand without room shows error",
+    "steps": [
+      {
+        "send": { "text": "/hand" },
+        "expect": [
+          { "method": "sendMessage", "payload": { "text": "You're not in a room right now — create or join one from /start." } }
+        ]
+      }
+    ]
+  }
+]
