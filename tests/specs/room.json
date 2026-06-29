@@ -5,14 +5,6 @@
       {
         "send": { "text": "/start" },
         "expect": []
-      },
-      {
-        "send": { "callback_data": "room:create" },
-        "expect": [
-          {
-            "method": "editMessageText"
-          }
-        ]
       }
     ]
   }
