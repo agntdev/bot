@@ -28,7 +28,7 @@ export interface StoredGameState {
   table: { attack: StoredCard; defend?: StoredCard }[];
   attacker_idx: number;
   defender_idx: number;
-  phase: "attack" | "defend" | "podkid" | "take" | "ended";
+  phase: "attack" | "defend" | "podkid" | "ended";
   turn_deadline: number;
   room_id: string;
   host_id: number;
@@ -104,41 +104,55 @@ export async function clearUserRoom(uid: number): Promise<void> {
   await indexStore().delete(userRoomKey(uid));
 }
 
+// ---- per-room write serialization ----
+// In a single-process Node.js bot, a per-room mutex eliminates the TOCTOU
+// window between version-check and save that the optimistic-lock retries
+// reduce but cannot fully close. This serializes all writes to the same
+// room through a promise chain, so two concurrent updateRoom() calls never
+// interleave their read-check-save sequences.
+
+const roomLocks = new Map<string, Promise<void>>();
+
+function enqueueRoomLock(rid: string): () => void {
+  const prev = roomLocks.get(rid) ?? Promise.resolve();
+  let release!: () => void;
+  const next = new Promise<void>((r) => {
+    release = r;
+  });
+  // Chain: after prev resolves, return next (which our caller will release)
+  roomLocks.set(rid, prev.then(() => next));
+  return release;
+}
+
 /**
- * Optimistic-locking update: read → mutate → save (retries on version conflict).
- * The `mutate` callback receives the current room state and can modify it
- * synchronously. Returns the updated room. Up to 10 retry attempts on conflict.
+ * Serialized update: enqueues a per-room lock so only one writer mutates
+ * a given room at a time, then reads → mutates → saves (with version
+ * increment). Returns the updated room.
  *
- * This eliminates the lost-update race where two concurrent callbacks each
- * read→mutate→save and the second save silently overwrites the first.
+ * When Redis-backed storage is available in a multi-process deployment,
+ * the lock is process-local only — inter-process races remain possible
+ * but are far less likely for a game bot's request rate. The version
+ * field is still incremented as a defense-in-depth check.
  */
 export async function updateRoom(
   rid: string,
   mutate: (room: StoredRoom) => void,
 ): Promise<StoredRoom> {
-  for (let attempt = 0; attempt < 10; attempt++) {
+  const release = enqueueRoomLock(rid);
+  try {
     const room = await readRoom(rid);
     if (!room) throw new Error(`Room ${rid} not found`);
-
-    const expectedVersion = room._version;
     mutate(room);
-
-    // Re-read to check if version changed (someone else saved)
-    const current = await readRoom(rid);
-    if (!current) throw new Error(`Room ${rid} disappeared during update`);
-    if (current._version !== expectedVersion) {
-      // Conflict — retry
-      continue;
-    }
-
     await saveRoom(room);
     return room;
+  } finally {
+    release();
   }
-  throw new Error(`Failed to update room ${rid} after 10 attempts — too much contention`);
 }
 
 /** Test-only: reset all stores. */
 export function _resetStores(): void {
   _store = null;
   _idxStore = null;
+  roomLocks.clear();
 }

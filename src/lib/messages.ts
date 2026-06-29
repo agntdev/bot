@@ -14,7 +14,7 @@ export function publicStateText(g: StoredGameState): string {
           .join("\n");
   const attacker = g.players[g.attacker_idx].telegram_name;
   const defender = g.players[g.defender_idx].telegram_name;
-  const phaseLabel = { attack: "⚔️ Attack", defend: "🛡 Defend", podkid: "🎯 Podkid", take: "⛔ Taking", ended: "🏁 Ended" }[g.phase];
+  const phaseLabel = { attack: "⚔️ Attack", defend: "🛡 Defend", podkid: "🎯 Podkid", ended: "🏁 Ended" }[g.phase];
   const deckInfo = `Deck: ${g.deck.length} card${g.deck.length !== 1 ? "s" : ""}`;
 
   return (

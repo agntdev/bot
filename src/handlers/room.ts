@@ -9,6 +9,7 @@ import {
   saveRoom,
   readRoom,
   deleteRoom,
+  updateRoom,
   setUserRoom,
   getUserRoom,
   clearUserRoom,
@@ -187,21 +188,31 @@ composer.callbackQuery(/^room:settings:(.+)$/, async (ctx) => {
 composer.callbackQuery(/^room:setmax:(.+):(\d+)$/, async (ctx) => {
   const rid = ctx.match![1];
   const val = parseInt(ctx.match![2], 10);
-  const room = await readRoom(rid);
-  if (!room || room.host_id !== ctx.from!.id) {
-    await ctx.answerCallbackQuery({ text: "Only the host can change settings.", show_alert: true });
-    return;
-  }
-  if (room.game) {
-    await ctx.answerCallbackQuery({ text: "Can't change settings after the game starts.", show_alert: true });
+
+  try {
+    await updateRoom(rid, (room) => {
+      if (room.host_id !== ctx.from!.id) throw new Error("not-host");
+      if (room.game) throw new Error("game-started");
+      room.max_players = val;
+    });
+  } catch (err) {
+    if (err instanceof Error && err.message === "not-host") {
+      await ctx.answerCallbackQuery({ text: "Only the host can change settings.", show_alert: true });
+      return;
+    }
+    if (err instanceof Error && err.message === "game-started") {
+      await ctx.answerCallbackQuery({ text: "Can't change settings after the game starts.", show_alert: true });
+      return;
+    }
+    await ctx.answerCallbackQuery({ text: "Room not found.", show_alert: true });
     return;
   }
 
-  room.max_players = val;
-  await saveRoom(room);
   await ctx.answerCallbackQuery({ text: `Max players set to ${val}.`, show_alert: false });
 
   // Re-render the settings view with the new value
+  const room = await readRoom(rid);
+  if (!room) return;
   const playerCounts = [2, 3, 4, 5, 6];
   const handSizes = [4, 5, 6];
   await ctx.editMessageText(
@@ -233,21 +244,31 @@ composer.callbackQuery(/^room:setmax:(.+):(\d+)$/, async (ctx) => {
 composer.callbackQuery(/^room:sethand:(.+):(\d+)$/, async (ctx) => {
   const rid = ctx.match![1];
   const val = parseInt(ctx.match![2], 10);
-  const room = await readRoom(rid);
-  if (!room || room.host_id !== ctx.from!.id) {
-    await ctx.answerCallbackQuery({ text: "Only the host can change settings.", show_alert: true });
-    return;
-  }
-  if (room.game) {
-    await ctx.answerCallbackQuery({ text: "Can't change settings after the game starts.", show_alert: true });
+
+  try {
+    await updateRoom(rid, (room) => {
+      if (room.host_id !== ctx.from!.id) throw new Error("not-host");
+      if (room.game) throw new Error("game-started");
+      room.initial_hand_size = val;
+    });
+  } catch (err) {
+    if (err instanceof Error && err.message === "not-host") {
+      await ctx.answerCallbackQuery({ text: "Only the host can change settings.", show_alert: true });
+      return;
+    }
+    if (err instanceof Error && err.message === "game-started") {
+      await ctx.answerCallbackQuery({ text: "Can't change settings after the game starts.", show_alert: true });
+      return;
+    }
+    await ctx.answerCallbackQuery({ text: "Room not found.", show_alert: true });
     return;
   }
 
-  room.initial_hand_size = val;
-  await saveRoom(room);
   await ctx.answerCallbackQuery({ text: `Hand size set to ${val}.`, show_alert: false });
 
   // Re-render the settings view with the new value
+  const room = await readRoom(rid);
+  if (!room) return;
   const playerCounts = [2, 3, 4, 5, 6];
   const handSizes = [4, 5, 6];
   await ctx.editMessageText(
@@ -371,21 +392,22 @@ async function handleJoinRoom(ctx: Ctx, rid: string): Promise<void> {
 }
 
 async function doJoinRoom(ctx: Ctx, rid: string, uid: number): Promise<void> {
-  const room = await readRoom(rid);
-  if (!room) {
+  const name = ctx.from!.first_name || "Player";
+  let room: StoredRoom;
+  try {
+    room = await updateRoom(rid, (r) => {
+      const existing = r.players.find((p) => p.user_id === uid);
+      if (existing) {
+        existing.status = "lobby";
+      } else {
+        r.players.push(makePlayer(uid, name));
+      }
+    });
+  } catch {
     await ctx.reply("Couldn't find that room — it may have ended. Ask the host for a fresh invite link.");
     return;
   }
 
-  const existing = room.players.find((p) => p.user_id === uid);
-  if (existing) {
-    existing.status = "lobby";
-  } else {
-    const name = ctx.from!.first_name || "Player";
-    room.players.push(makePlayer(uid, name));
-  }
-
-  await saveRoom(room);
   await setUserRoom(uid, rid);
 
   await ctx.reply(
@@ -393,7 +415,7 @@ async function doJoinRoom(ctx: Ctx, rid: string, uid: number): Promise<void> {
   );
 
   // Notify other players in the room
-  const joinerName = ctx.from!.first_name || "Player";
+  const joinerName = name;
   for (const p of room.players) {
     if (p.user_id !== uid && p.status !== "left") {
       try {
@@ -428,7 +450,22 @@ composer.callbackQuery(/^game:start:(.+)$/, async (ctx) => {
 
   // Create and shuffle deck
   const deck = shuffleDeck(createDeck());
-  const handSize = room.initial_hand_size;
+  let handSize = room.initial_hand_size;
+
+  // Safety: deal must leave at least 1 card for the trump.
+  const totalNeeded = handSize * activePlayers.length;
+  const minDeckReserve = 1;
+  if (totalNeeded + minDeckReserve > deck.length) {
+    const maxSafe = Math.floor((deck.length - minDeckReserve) / activePlayers.length);
+    if (maxSafe < 1) {
+      await ctx.reply("Not enough cards for this many players — reduce the player count.");
+      return;
+    }
+    handSize = maxSafe;
+    await ctx.reply(
+      `⚠️ Hand size adjusted to ${handSize} — not enough cards for ${room.initial_hand_size} each with ${activePlayers.length} players.`,
+    );
+  }
 
   // Deal to players
   for (const p of activePlayers) {
@@ -436,7 +473,11 @@ composer.callbackQuery(/^game:start:(.+)$/, async (ctx) => {
     p.status = "playing";
   }
 
-  // Trump card — bottom of deck
+  // Trump card — bottom of remaining deck (guaranteed to exist by check above)
+  if (deck.length === 0) {
+    await ctx.reply("Couldn’t start the game — not enough cards. Try fewer players or a smaller hand size.");
+    return;
+  }
   const trumpCard = deck[deck.length - 1];
   const trumpSuit = trumpCard.suit;
 
