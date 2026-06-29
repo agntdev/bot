@@ -1,0 +1,13 @@
+[
+  {
+    "name": "nop:settings callback is answered without alert",
+    "steps": [
+      {
+        "send": { "callback": "nop:settings" },
+        "expect": [
+          { "method": "answerCallbackQuery" }
+        ]
+      }
+    ]
+  }
+]

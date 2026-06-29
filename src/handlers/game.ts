@@ -1094,9 +1094,16 @@ composer.callbackQuery(/^game:end:(.+)$/, async (ctx) => {
   await broadcastGameEndApi(ctx.api, updatedRoom.game!);
 });
 
+// ---- nop:settings — room settings separator, answer without misleading game message ----
+
+composer.callbackQuery("nop:settings", async (ctx) => {
+  await ctx.answerCallbackQuery();
+});
+
 // ---- nop: catch-all for non-playable card taps ----
 
 composer.callbackQuery(/^nop:(.+)$/, async (ctx) => {
+  if (ctx.callbackQuery.data === "nop:settings") return; // handled above
   await ctx.answerCallbackQuery({ text: "It's not your turn — wait for your go!", show_alert: false });
 });
 
