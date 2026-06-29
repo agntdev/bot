@@ -309,21 +309,38 @@ export async function sendPrivateHand(
     return;
   }
 
-  const isAttacker = game.players[game.attacker_idx].user_id === uid;
-  const isDefender = game.players[game.defender_idx].user_id === uid;
+  const isAttacker = game.players[game.attacker_idx]?.user_id === uid;
+  const isDefender = game.players[game.defender_idx]?.user_id === uid;
 
-  // Build card buttons (3 per row)
+  // Determine if this player can act right now and what action prefix to use.
+  let canAct = false;
+  let actionPrefix = "";
+  if (game.phase === "attack" && isAttacker) {
+    canAct = true;
+    actionPrefix = "atk";
+  } else if (game.phase === "defend" && isDefender) {
+    canAct = true;
+    actionPrefix = "def";
+  } else if (game.phase === "podkid" && !isDefender && isPlayerActiveInGame(player, game)) {
+    canAct = true;
+    actionPrefix = "pod";
+  }
+
+  const isWaiting = !canAct;
+
+  // Build card buttons (3 per row) — only if the player can act.
   const rows: ReturnType<typeof inlineButton>[][] = [];
   for (let i = 0; i < hand.length; i += 3) {
     rows.push(
       hand.slice(i, i + 3).map((c: StoredCard, j: number) => {
         const idx = i + j;
-        let action: string;
-        if (game.phase === "attack" && isAttacker) action = `atk`;
-        else if (game.phase === "defend" && isDefender) action = `def`;
-        else if (game.phase === "podkid" && !isDefender) action = `pod`;
-        else action = ""; // can't play
-        return inlineButton(`${c.rank}${c.suit}`, `${action}:${rid}:${idx}`);
+        if (!canAct) {
+          // Show text labels without callbacks so tapping does nothing —
+          // avoid creating buttons with empty action prefixes that never
+          // get answered, which causes the Telegram spinner to hang.
+          return inlineButton(`· ${c.rank}${c.suit}`, `nop:${rid}`);
+        }
+        return inlineButton(`${c.rank}${c.suit}`, `${actionPrefix}:${rid}:${idx}`);
       }),
     );
   }
@@ -336,7 +353,7 @@ export async function sendPrivateHand(
   if (game.phase === "defend" && isDefender) {
     actionRow.push(inlineButton("⛔ Take cards", `take:${rid}`));
   }
-  if (game.phase === "podkid" && !isDefender) {
+  if (game.phase === "podkid" && !isDefender && isPlayerActiveInGame(player, game)) {
     actionRow.push(inlineButton("✅ Done tossing", `done:${rid}`));
   }
 
@@ -348,7 +365,7 @@ export async function sendPrivateHand(
       ? "🎯 Your turn to attack!"
       : game.phase === "defend" && isDefender
         ? "🛡 Defend!"
-        : game.phase === "podkid" && !isDefender
+        : game.phase === "podkid" && !isDefender && isPlayerActiveInGame(player, game)
           ? "🎯 Toss more cards in!"
           : "⏳ Waiting...";
 
@@ -363,7 +380,8 @@ export async function sendPrivateHand(
     `${phaseLabel}\n\n` +
     `Trump: ${game.trump_card.rank}${game.trump_suit}   Deck: ${game.deck.length}\n\n` +
     `Table:\n${tableStr}\n\n` +
-    `Your hand (${hand.length} card${hand.length !== 1 ? "s" : ""}):`;
+    `Your hand (${hand.length} card${hand.length !== 1 ? "s" : ""}):` +
+    (isWaiting ? `\n\n_It's not your turn — sit tight!_` : "");
 
   try {
     await ctx.api.sendMessage(uid, text, {
@@ -373,6 +391,45 @@ export async function sendPrivateHand(
     // user blocked bot — skip
   }
 }
+
+/** Check if a player is an active participant (not left / durak). */
+function isPlayerActiveInGame(p: StoredPlayer, _g: StoredGameState): boolean {
+  return p.status === "playing";
+}
+
+// ---- nop: catch-all for non-playable card taps ----
+// When a player who can't act taps a card button, it sends nop:ROOMID.
+// Answer the callback query so Telegram's spinner doesn't hang, and show
+// an ephemeral alert telling the user why they can't play.
+
+composer.callbackQuery(/^nop:(.+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery({ text: "It's not your turn — wait for your go!", show_alert: false });
+});
+
+// ---- catch-all for unknown game-related callback data — prevents stuck spinners ----
+// Any callback_queries that start with a known game-action prefix but aren't
+// handled by a specific handler land here, so the Telegram spinner is always
+// answered instead of spinning forever with no visible action.
+
+composer.on("callback_query", async (ctx, next) => {
+  const data = ctx.callbackQuery.data;
+  if (!data) return next();
+  // Only guard game-action callbacks (atk:, def:, pod:, take:, done:).
+  // Everything else (menu:*, game:start:*, help buttons, etc.) passes through.
+  const gamePrefixes = ["atk:", "def:", "pod:", "take:", "done:", "nop:"];
+  const isGame = gamePrefixes.some((p) => data.startsWith(p));
+  if (!isGame) return next();
+
+  console.warn("[room] unhandled game callback", {
+    userId: ctx.from?.id,
+    callbackData: data,
+  });
+  try {
+    await ctx.answerCallbackQuery({ text: "That action isn't available right now.", show_alert: false });
+  } catch {
+    // best effort
+  }
+});
 
 export async function broadcastPublicState(
   ctx: Ctx,
