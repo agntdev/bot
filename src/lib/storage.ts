@@ -44,6 +44,8 @@ export interface StoredRoom {
   game?: StoredGameState;
   publicMessageId?: number;
   publicChatId?: number;
+  /** Optimistic-concurrency version — incremented on every save. */
+  _version: number;
 }
 
 /** Wrapper object so the index satisfies StorageAdapter's object constraint. */
@@ -75,7 +77,9 @@ function indexStore(): StorageAdapter<UserRoomEntry> {
 
 // ---- Public API ----
 
+/** Blind save — increments version. Use `updateRoom` for concurrency-safe mutations. */
 export async function saveRoom(room: StoredRoom): Promise<void> {
+  room._version = (room._version ?? 0) + 1;
   await roomStore().write(roomKey(room.room_id), room);
 }
 
@@ -98,6 +102,39 @@ export async function getUserRoom(uid: number): Promise<string | undefined> {
 
 export async function clearUserRoom(uid: number): Promise<void> {
   await indexStore().delete(userRoomKey(uid));
+}
+
+/**
+ * Optimistic-locking update: read → mutate → save (retries on version conflict).
+ * The `mutate` callback receives the current room state and can modify it
+ * synchronously. Returns the updated room. Up to 10 retry attempts on conflict.
+ *
+ * This eliminates the lost-update race where two concurrent callbacks each
+ * read→mutate→save and the second save silently overwrites the first.
+ */
+export async function updateRoom(
+  rid: string,
+  mutate: (room: StoredRoom) => void,
+): Promise<StoredRoom> {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const room = await readRoom(rid);
+    if (!room) throw new Error(`Room ${rid} not found`);
+
+    const expectedVersion = room._version;
+    mutate(room);
+
+    // Re-read to check if version changed (someone else saved)
+    const current = await readRoom(rid);
+    if (!current) throw new Error(`Room ${rid} disappeared during update`);
+    if (current._version !== expectedVersion) {
+      // Conflict — retry
+      continue;
+    }
+
+    await saveRoom(room);
+    return room;
+  }
+  throw new Error(`Failed to update room ${rid} after 10 attempts — too much contention`);
 }
 
 /** Test-only: reset all stores. */

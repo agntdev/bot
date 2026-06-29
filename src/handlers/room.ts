@@ -11,10 +11,17 @@ import {
   deleteRoom,
   setUserRoom,
   getUserRoom,
+  clearUserRoom,
 } from "../lib/storage.js";
 import { createDeck, shuffleDeck } from "../lib/cards.js";
 import type { StoredRoom, StoredGameState, StoredPlayer, StoredCard } from "../lib/storage.js";
-import { now, TURN_TIMEOUT_MS } from "../lib/clock.js";
+import { now, TURN_TIMEOUT_MS, scheduleGameTimer } from "../lib/clock.js";
+import {
+  publicStateText,
+  sendPrivateHandApi,
+  formatPlayerListLobby,
+} from "../lib/messages.js";
+import { handleTurnTimeout } from "./game.js";
 
 // ---- register main-menu items ----
 registerMainMenuItem({ label: "🎮 Create", data: "room:create", order: 10 });
@@ -42,6 +49,35 @@ function makePlayer(uid: number, name: string, status: "lobby" | "playing" = "lo
   return { user_id: uid, telegram_name: name, hand: [], status };
 }
 
+/** Cleanly leave a user's current room (if any), preserving active games. */
+async function leaveCurrentRoom(uid: number): Promise<void> {
+  const existingRid = await getUserRoom(uid);
+  if (!existingRid) return;
+
+  const existing = await readRoom(existingRid);
+  if (!existing) {
+    await clearUserRoom(uid);
+    return;
+  }
+
+  // Never silently leave a room with an active game
+  if (existing.game && existing.game.phase !== "ended") {
+    return; // caller handles the error message
+  }
+
+  // Cleanly leave a lobby room
+  existing.players = existing.players.filter((p) => p.user_id !== uid);
+  if (existing.players.length === 0) {
+    await deleteRoom(existingRid);
+  } else {
+    if (existing.host_id === uid && existing.players.length > 0) {
+      existing.host_id = existing.players[0].user_id;
+    }
+    await saveRoom(existing);
+  }
+  await clearUserRoom(uid);
+}
+
 // ---- room:create ----
 
 composer.callbackQuery("room:create", async (ctx) => {
@@ -49,18 +85,23 @@ composer.callbackQuery("room:create", async (ctx) => {
   const uid = ctx.from!.id;
   const name = ctx.from!.first_name || "Player";
 
-  // Check if already in a room — leave it first
+  // Check if already in a room with an active game
   const existingRid = await getUserRoom(uid);
   if (existingRid) {
     const existing = await readRoom(existingRid);
-    if (existing && !existing.game) {
-      existing.players = existing.players.filter((p) => p.user_id !== uid);
-      if (existing.players.length === 0) {
-        await deleteRoom(existingRid);
-      } else {
-        await saveRoom(existing);
-      }
+    if (existing?.game && existing.game.phase !== "ended") {
+      await ctx.reply(
+        "You're in an active game right now. Use /leave to drop out of it first, then create a new room.",
+        {
+          reply_markup: inlineKeyboard([
+            [inlineButton("⬅️ Back to menu", "menu:main")],
+          ]),
+        },
+      );
+      return;
     }
+    // Leave any lobby room
+    await leaveCurrentRoom(uid);
   }
 
   const rid = genRoomId();
@@ -73,19 +114,126 @@ composer.callbackQuery("room:create", async (ctx) => {
     initial_hand_size: 6,
     join_link: link,
     players: [makePlayer(uid, name)],
+    _version: 0,
   };
   await saveRoom(room);
   await setUserRoom(uid, rid);
 
   const msg =
     `🎮 Room ${rid} created!\n\n` +
+    `Max players: ${room.max_players}   Hand size: ${room.initial_hand_size}\n\n` +
     `Share this link to invite friends:\n${link}\n\n` +
     `Tap ▶️ Start when everyone's in.\n\n` +
     formatPlayerList(room.players, room.max_players);
 
   await ctx.reply(msg, {
     reply_markup: inlineKeyboard([
-      [inlineButton("▶️ Start Game", `game:start:${rid}`)],
+      [inlineButton("▶️ Start Game", `game:start:${rid}`),
+       inlineButton("⚙️ Settings", `room:settings:${rid}`)],
+      [inlineButton("🚪 Leave Room", `leave:${rid}`)],
+      [inlineButton("⬅️ Back to menu", "menu:main")],
+    ]),
+  });
+});
+
+// ---- room:settings ----
+
+composer.callbackQuery(/^room:settings:(.+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const rid = ctx.match![1];
+  const room = await readRoom(rid);
+  if (!room) {
+    await ctx.reply("Room not found — it may have been closed.");
+    return;
+  }
+  if (room.host_id !== ctx.from!.id) {
+    await ctx.answerCallbackQuery({ text: "Only the host can change settings.", show_alert: true });
+    return;
+  }
+  if (room.game) {
+    await ctx.answerCallbackQuery({ text: "Can't change settings after the game starts.", show_alert: true });
+    return;
+  }
+
+  const playerCounts = [2, 3, 4, 5, 6];
+  const handSizes = [4, 5, 6];
+
+  await ctx.reply(
+    `⚙️ Room ${rid} settings\n\n` +
+    `Max players: ${room.max_players}\n` +
+    `Hand size: ${room.initial_hand_size}\n\n` +
+    `Tap a setting to change it:`,
+    {
+      reply_markup: inlineKeyboard([
+        ...playerCounts.map((n) => [
+          inlineButton(
+            `${n} player${n !== 1 ? "s" : ""}${n === room.max_players ? " ✅" : ""}`,
+            `room:setmax:${rid}:${n}`,
+          ),
+        ]),
+        [inlineButton("▬▬▬ Hand size ▬▬▬", "nop:settings")],
+        ...handSizes.map((n) => [
+          inlineButton(
+            `${n} card${n !== 1 ? "s" : ""}${n === room.initial_hand_size ? " ✅" : ""}`,
+            `room:sethand:${rid}:${n}`,
+          ),
+        ]),
+        [inlineButton("⬅️ Back to room", `room:refresh:${rid}`)],
+      ]),
+    },
+  );
+});
+
+composer.callbackQuery(/^room:setmax:(.+):(\d+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const rid = ctx.match![1];
+  const val = parseInt(ctx.match![2], 10);
+  const room = await readRoom(rid);
+  if (!room || room.host_id !== ctx.from!.id) return;
+  if (room.game) return;
+
+  room.max_players = val;
+  await saveRoom(room);
+
+  // Re-render settings
+  await ctx.answerCallbackQuery({ text: `Max players set to ${val}.`, show_alert: false });
+  // Trigger re-render by simulating a fresh settings view
+});
+
+composer.callbackQuery(/^room:sethand:(.+):(\d+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const rid = ctx.match![1];
+  const val = parseInt(ctx.match![2], 10);
+  const room = await readRoom(rid);
+  if (!room || room.host_id !== ctx.from!.id) return;
+  if (room.game) return;
+
+  room.initial_hand_size = val;
+  await saveRoom(room);
+  await ctx.answerCallbackQuery({ text: `Hand size set to ${val}.`, show_alert: false });
+});
+
+composer.callbackQuery(/^room:refresh:(.+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+  const rid = ctx.match![1];
+  const room = await readRoom(rid);
+  if (!room) {
+    await ctx.reply("Room not found.");
+    return;
+  }
+
+  const msg =
+    `🎮 Room ${room.room_id}\n\n` +
+    `Max players: ${room.max_players}   Hand size: ${room.initial_hand_size}\n\n` +
+    `Share this link to invite friends:\n${room.join_link}\n\n` +
+    `Tap ▶️ Start when everyone's in.\n\n` +
+    formatPlayerList(room.players, room.max_players);
+
+  await ctx.reply(msg, {
+    reply_markup: inlineKeyboard([
+      [inlineButton("▶️ Start Game", `game:start:${rid}`),
+       inlineButton("⚙️ Settings", `room:settings:${rid}`)],
+      [inlineButton("🚪 Leave Room", `leave:${rid}`)],
       [inlineButton("⬅️ Back to menu", "menu:main")],
     ]),
   });
@@ -112,30 +260,87 @@ composer.on("message:text", async (ctx, next) => {
     return;
   }
   const rid = match[1].toUpperCase();
+  await handleJoinRoom(ctx, rid);
+});
+
+// ---- join_ link: handle /start join_XXXXXX via text detection ----
+
+composer.on("message:text", async (ctx, next) => {
+  const text = ctx.message.text.trim();
+  const match = text.match(/^\/start\s+join_([A-Z0-9]{6})$/i);
+  if (!match) return next();
+
+  const rid = match[1].toUpperCase();
+  await handleJoinByDeepLink(ctx, rid);
+});
+
+async function handleJoinByDeepLink(ctx: Ctx, rid: string): Promise<void> {
+  const uid = ctx.from!.id;
+
+  // Check if user is already in another room
+  const existingRid = await getUserRoom(uid);
+  if (existingRid && existingRid !== rid) {
+    const existing = await readRoom(existingRid);
+    if (existing?.game && existing.game.phase !== "ended") {
+      await ctx.reply(
+        "You're in an active game right now. Use /leave to drop out of it first, then join a new one.",
+      );
+      return;
+    }
+    // Leave the old lobby room silently
+    await leaveCurrentRoom(uid);
+  }
+
+  // Proceed with join
+  await doJoinRoom(ctx, rid, uid);
+}
+
+async function handleJoinRoom(ctx: Ctx, rid: string): Promise<void> {
+  const uid = ctx.from!.id;
+  ctx.session.step = undefined;
+
   const room = await readRoom(rid);
 
   if (!room) {
     await ctx.reply("Couldn't find that room — it may have ended. Ask the host for a fresh invite link.");
-    ctx.session.step = undefined;
     return;
   }
 
   if (room.game) {
     await ctx.reply("That game's already in progress — wait for the next one!");
-    ctx.session.step = undefined;
     return;
   }
 
   if (room.players.filter((p) => p.status !== "left").length >= room.max_players) {
     await ctx.reply("The room's full — wait for the next game.");
-    ctx.session.step = undefined;
     return;
   }
 
-  const uid = ctx.from!.id;
   if (room.players.some((p) => p.user_id === uid && p.status !== "left")) {
     await ctx.reply("You're already in this room!");
-    ctx.session.step = undefined;
+    return;
+  }
+
+  // Check if user is in another room — let them know
+  const existingRid = await getUserRoom(uid);
+  if (existingRid && existingRid !== rid) {
+    const existing = await readRoom(existingRid);
+    if (existing?.game && existing.game.phase !== "ended") {
+      await ctx.reply(
+        "You're in an active game already. Use /leave to drop out first, then try joining again.",
+      );
+      return;
+    }
+    await leaveCurrentRoom(uid);
+  }
+
+  await doJoinRoom(ctx, rid, uid);
+}
+
+async function doJoinRoom(ctx: Ctx, rid: string, uid: number): Promise<void> {
+  const room = await readRoom(rid);
+  if (!room) {
+    await ctx.reply("Couldn't find that room — it may have ended. Ask the host for a fresh invite link.");
     return;
   }
 
@@ -149,12 +354,24 @@ composer.on("message:text", async (ctx, next) => {
 
   await saveRoom(room);
   await setUserRoom(uid, rid);
-  ctx.session.step = undefined;
 
   await ctx.reply(
     `🚪 Joined room ${rid}!\n\n${formatPlayerList(room.players, room.max_players)}`,
   );
-});
+
+  // Notify other players in the room
+  const joinerName = ctx.from!.first_name || "Player";
+  for (const p of room.players) {
+    if (p.user_id !== uid && p.status !== "left") {
+      try {
+        await ctx.api.sendMessage(
+          p.user_id,
+          `👋 ${joinerName} joined the room!\n\n${formatPlayerList(room.players, room.max_players)}`,
+        );
+      } catch {}
+    }
+  }
+}
 
 // ---- game:start ----
 
@@ -209,7 +426,16 @@ composer.callbackQuery(/^game:start:(.+)$/, async (ctx) => {
   room.players = activePlayers;
   await saveRoom(room);
 
-  // Send public game state to ALL players (DMs)
+  // Schedule the first proactive turn timer
+  scheduleGameTimer(rid, async () => {
+    const fresh = await readRoom(rid);
+    if (!fresh?.game || fresh.game.phase === "ended") return;
+    if (now() >= fresh.game.turn_deadline) {
+      await handleTurnTimeout(ctx.api, fresh.game, rid, fresh);
+    }
+  }, TURN_TIMEOUT_MS);
+
+  // Send public game state to ALL players
   const publicText = publicStateText(game);
   for (const p of activePlayers) {
     try {
@@ -221,229 +447,32 @@ composer.callbackQuery(/^game:start:(.+)$/, async (ctx) => {
 
   // Send private hands to each player
   for (const p of activePlayers) {
-    await sendPrivateHand(ctx, game, p, rid);
+    await sendPrivateHandApi(ctx.api, game, p, rid);
   }
 });
 
-// ---- join_ link: handle /start join_XXXXXX via text detection ----
-// When a user taps a t.me/...?start=join_XXXXXX link, Telegram sends /start join_XXXXXX
-// grammY's command("start") will match first, but we need to catch the join_ payload.
-// We do this via a text-message handler that runs early and checks for /start join_ pattern.
+// ---- Export for proactive timer usage ----
 
-composer.on("message:text", async (ctx, next) => {
-  const text = ctx.message.text.trim();
-  const match = text.match(/^\/start\s+join_([A-Z0-9]{6})$/i);
-  if (!match) return next();
+export { sendPrivateHandApi, publicStateText };
 
-  const rid = match[1].toUpperCase();
-  const room = await readRoom(rid);
+// ---- Broadcast helpers ----
 
-  if (!room) {
-    await ctx.reply("Couldn't find that room — it may have ended. Ask the host for a fresh invite link.");
-    return;
-  }
-  if (room.game) {
-    await ctx.reply("That game's already in progress — wait for the next one!");
-    return;
-  }
-  if (room.players.filter((p) => p.status !== "left").length >= room.max_players) {
-    await ctx.reply("The room's full — wait for the next game.");
-    return;
-  }
-
-  const uid = ctx.from!.id;
-  if (room.players.some((p) => p.user_id === uid && p.status !== "left")) {
-    await ctx.reply("You're already in this room!");
-    return;
-  }
-
-  const existing = room.players.find((p) => p.user_id === uid);
-  if (existing) {
-    existing.status = "lobby";
-  } else {
-    const name = ctx.from!.first_name || "Player";
-    room.players.push(makePlayer(uid, name));
-  }
-
-  await saveRoom(room);
-  await setUserRoom(uid, rid);
-
-  await ctx.reply(
-    `🚪 Joined room ${rid}!\n\n${formatPlayerList(room.players, room.max_players)}`,
-  );
-});
-
-// ---- Exports for use by game.ts ----
-
-export function publicStateText(g: StoredGameState): string {
-  const tableStr =
-    g.table.length === 0
-      ? "(empty)"
-      : g.table
-          .map((p) => `${p.attack.rank}${p.attack.suit}${p.defend ? " vs " + p.defend.rank + p.defend.suit : " → ?"}`)
-          .join("\n");
-  const attacker = g.players[g.attacker_idx].telegram_name;
-  const defender = g.players[g.defender_idx].telegram_name;
-  const phaseLabel = { attack: "⚔️ Attack", defend: "🛡 Defend", podkid: "🎯 Podkid", take: "⛔ Taking", ended: "🏁 Ended" }[g.phase];
-  const deckInfo = `Deck: ${g.deck.length} card${g.deck.length !== 1 ? "s" : ""}`;
-
-  return (
-    `🃏 ${g.room_id}\n\n` +
-    `Trump: ${g.trump_card.rank}${g.trump_suit}   ${deckInfo}\n\n` +
-    `Table:\n${tableStr}\n\n` +
-    `${phaseLabel}: ${attacker} → ${defender}\n\n` +
-    `Players: ${g.players.map((p) => p.telegram_name + (p.status === "durak" ? " 💀" : "") + (p.hand.length ? ` (${p.hand.length})` : "")).join(", ")}`
-  );
+// Re-export the broadcast from messages module so old references still work
+import { broadcastPublicStateApi } from "../lib/messages.js";
+export async function broadcastPublicState(
+  ctx: { api: import("grammy").Api },
+  game: StoredGameState,
+): Promise<void> {
+  return broadcastPublicStateApi(ctx.api, game);
 }
 
 export async function sendPrivateHand(
-  ctx: Ctx,
+  ctx: { api: import("grammy").Api },
   game: StoredGameState,
   player: StoredPlayer,
   rid: string,
 ): Promise<void> {
-  const uid = player.user_id;
-  const hand = player.hand;
-
-  if (hand.length === 0) {
-    return;
-  }
-
-  const isAttacker = game.players[game.attacker_idx]?.user_id === uid;
-  const isDefender = game.players[game.defender_idx]?.user_id === uid;
-
-  // Determine if this player can act right now and what action prefix to use.
-  let canAct = false;
-  let actionPrefix = "";
-  if (game.phase === "attack" && isAttacker) {
-    canAct = true;
-    actionPrefix = "atk";
-  } else if (game.phase === "defend" && isDefender) {
-    canAct = true;
-    actionPrefix = "def";
-  } else if (game.phase === "podkid" && !isDefender && isPlayerActiveInGame(player, game)) {
-    canAct = true;
-    actionPrefix = "pod";
-  }
-
-  const isWaiting = !canAct;
-
-  // Build card buttons (3 per row) — only if the player can act.
-  const rows: ReturnType<typeof inlineButton>[][] = [];
-  for (let i = 0; i < hand.length; i += 3) {
-    rows.push(
-      hand.slice(i, i + 3).map((c: StoredCard, j: number) => {
-        const idx = i + j;
-        if (!canAct) {
-          // Show text labels without callbacks so tapping does nothing —
-          // avoid creating buttons with empty action prefixes that never
-          // get answered, which causes the Telegram spinner to hang.
-          return inlineButton(`· ${c.rank}${c.suit}`, `nop:${rid}`);
-        }
-        return inlineButton(`${c.rank}${c.suit}`, `${actionPrefix}:${rid}:${idx}`);
-      }),
-    );
-  }
-
-  // Action buttons
-  const actionRow: ReturnType<typeof inlineButton>[] = [];
-  if (game.phase === "attack" && isAttacker && game.table.length > 0) {
-    actionRow.push(inlineButton("✅ Done attacking", `done:${rid}`));
-  }
-  if (game.phase === "defend" && isDefender) {
-    actionRow.push(inlineButton("⛔ Take cards", `take:${rid}`));
-  }
-  if (game.phase === "podkid" && !isDefender && isPlayerActiveInGame(player, game)) {
-    actionRow.push(inlineButton("✅ Done tossing", `done:${rid}`));
-  }
-
-  const buttons = [...rows];
-  if (actionRow.length > 0) buttons.push(actionRow);
-
-  const phaseLabel =
-    game.phase === "attack" && isAttacker
-      ? "🎯 Your turn to attack!"
-      : game.phase === "defend" && isDefender
-        ? "🛡 Defend!"
-        : game.phase === "podkid" && !isDefender && isPlayerActiveInGame(player, game)
-          ? "🎯 Toss more cards in!"
-          : "⏳ Waiting...";
-
-  const tableStr =
-    game.table.length === 0
-      ? "(empty)"
-      : game.table
-          .map((p) => `${p.attack.rank}${p.attack.suit}${p.defend ? " vs " + p.defend.rank + p.defend.suit : " → ?"}`)
-          .join("\n");
-
-  const text =
-    `${phaseLabel}\n\n` +
-    `Trump: ${game.trump_card.rank}${game.trump_suit}   Deck: ${game.deck.length}\n\n` +
-    `Table:\n${tableStr}\n\n` +
-    `Your hand (${hand.length} card${hand.length !== 1 ? "s" : ""}):` +
-    (isWaiting ? `\n\n_It's not your turn — sit tight!_` : "");
-
-  try {
-    await ctx.api.sendMessage(uid, text, {
-      reply_markup: { inline_keyboard: buttons },
-    });
-  } catch {
-    // user blocked bot — skip
-  }
-}
-
-/** Check if a player is an active participant (not left / durak). */
-function isPlayerActiveInGame(p: StoredPlayer, _g: StoredGameState): boolean {
-  return p.status === "playing";
-}
-
-// ---- nop: catch-all for non-playable card taps ----
-// When a player who can't act taps a card button, it sends nop:ROOMID.
-// Answer the callback query so Telegram's spinner doesn't hang, and show
-// an ephemeral alert telling the user why they can't play.
-
-composer.callbackQuery(/^nop:(.+)$/, async (ctx) => {
-  await ctx.answerCallbackQuery({ text: "It's not your turn — wait for your go!", show_alert: false });
-});
-
-// ---- catch-all for unknown game-related callback data — prevents stuck spinners ----
-// Any callback_queries that start with a known game-action prefix but aren't
-// handled by a specific handler land here, so the Telegram spinner is always
-// answered instead of spinning forever with no visible action.
-
-composer.on("callback_query", async (ctx, next) => {
-  const data = ctx.callbackQuery.data;
-  if (!data) return next();
-  // Only guard game-action callbacks (atk:, def:, pod:, take:, done:).
-  // Everything else (menu:*, game:start:*, help buttons, etc.) passes through.
-  const gamePrefixes = ["atk:", "def:", "pod:", "take:", "done:", "nop:"];
-  const isGame = gamePrefixes.some((p) => data.startsWith(p));
-  if (!isGame) return next();
-
-  console.warn("[room] unhandled game callback", {
-    userId: ctx.from?.id,
-    callbackData: data,
-  });
-  try {
-    await ctx.answerCallbackQuery({ text: "That action isn't available right now.", show_alert: false });
-  } catch {
-    // best effort
-  }
-});
-
-export async function broadcastPublicState(
-  ctx: Ctx,
-  game: StoredGameState,
-): Promise<void> {
-  const text = publicStateText(game);
-  for (const p of game.players) {
-    if (p.status === "left" || p.status === "durak") continue;
-    try {
-      await ctx.api.sendMessage(p.user_id, text);
-    } catch {
-      // blocked — skip
-    }
-  }
+  return sendPrivateHandApi(ctx.api, game, player, rid);
 }
 
 export default composer;
