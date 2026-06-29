@@ -195,9 +195,33 @@ composer.callbackQuery(/^room:setmax:(.+):(\d+)$/, async (ctx) => {
   room.max_players = val;
   await saveRoom(room);
 
-  // Re-render settings
-  await ctx.answerCallbackQuery({ text: `Max players set to ${val}.`, show_alert: false });
-  // Trigger re-render by simulating a fresh settings view
+  const playerCounts = [2, 3, 4, 5, 6];
+  const handSizes = [4, 5, 6];
+
+  await ctx.editMessageText(
+    `⚙️ Room ${rid} settings\n\n` +
+    `Max players: ${room.max_players}\n` +
+    `Hand size: ${room.initial_hand_size}\n\n` +
+    `Tap a setting to change it:`,
+    {
+      reply_markup: inlineKeyboard([
+        ...playerCounts.map((n) => [
+          inlineButton(
+            `${n} player${n !== 1 ? "s" : ""}${n === room.max_players ? " ✅" : ""}`,
+            `room:setmax:${rid}:${n}`,
+          ),
+        ]),
+        [inlineButton("▬▬▬ Hand size ▬▬▬", "nop:settings")],
+        ...handSizes.map((n) => [
+          inlineButton(
+            `${n} card${n !== 1 ? "s" : ""}${n === room.initial_hand_size ? " ✅" : ""}`,
+            `room:sethand:${rid}:${n}`,
+          ),
+        ]),
+        [inlineButton("⬅️ Back to room", `room:refresh:${rid}`)],
+      ]),
+    },
+  );
 });
 
 composer.callbackQuery(/^room:sethand:(.+):(\d+)$/, async (ctx) => {
@@ -210,7 +234,34 @@ composer.callbackQuery(/^room:sethand:(.+):(\d+)$/, async (ctx) => {
 
   room.initial_hand_size = val;
   await saveRoom(room);
-  await ctx.answerCallbackQuery({ text: `Hand size set to ${val}.`, show_alert: false });
+
+  const playerCounts = [2, 3, 4, 5, 6];
+  const handSizes = [4, 5, 6];
+
+  await ctx.editMessageText(
+    `⚙️ Room ${rid} settings\n\n` +
+    `Max players: ${room.max_players}\n` +
+    `Hand size: ${room.initial_hand_size}\n\n` +
+    `Tap a setting to change it:`,
+    {
+      reply_markup: inlineKeyboard([
+        ...playerCounts.map((n) => [
+          inlineButton(
+            `${n} player${n !== 1 ? "s" : ""}${n === room.max_players ? " ✅" : ""}`,
+            `room:setmax:${rid}:${n}`,
+          ),
+        ]),
+        [inlineButton("▬▬▬ Hand size ▬▬▬", "nop:settings")],
+        ...handSizes.map((n) => [
+          inlineButton(
+            `${n} card${n !== 1 ? "s" : ""}${n === room.initial_hand_size ? " ✅" : ""}`,
+            `room:sethand:${rid}:${n}`,
+          ),
+        ]),
+        [inlineButton("⬅️ Back to room", `room:refresh:${rid}`)],
+      ]),
+    },
+  );
 });
 
 composer.callbackQuery(/^room:refresh:(.+)$/, async (ctx) => {

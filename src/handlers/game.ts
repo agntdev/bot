@@ -800,6 +800,13 @@ async function handleTurnTimeout(
           const fg = fresh.game;
           if (!fg || fg.phase === "ended") throw new GameActionError("Game ended.");
           if (fg.phase !== "attack") throw new GameActionError("Phase changed.");
+          // Mark empty-hand players as "out" when deck is exhausted
+          if (fg.deck.length === 0) {
+            for (const p of fg.players) {
+              if (isPlayerActive(p) && p.hand.length === 0) p.status = "out";
+            }
+          }
+          if (checkGameEnd(fg)) return;
           nextAttackerDefender(fg);
           fg.phase = "attack";
           fg.turn_deadline = deadline;
@@ -810,6 +817,10 @@ async function handleTurnTimeout(
       }
 
       const ug = updatedRoom.game!;
+      if (ug.phase === "ended") {
+        await broadcastGameEndApi(api, ug);
+        return;
+      }
       scheduleTurnTimer(api, rid, ug.turn_deadline);
       await broadcastPublicStateApi(api, ug);
       for (const p of ug.players) {
@@ -839,8 +850,9 @@ async function handleTurnTimeout(
           }
         }
         fg.table = [];
+        // Refill other active players — defender who took cards does NOT draw
         for (const p of fg.players) {
-          if (isPlayerActive(p)) {
+          if (p.user_id !== fd?.user_id && isPlayerActive(p)) {
             const needed = Math.max(0, upTo - p.hand.length);
             if (needed > 0) {
               const drawn = drawCards(fg, needed);
@@ -882,13 +894,16 @@ async function handleTurnTimeout(
         if (fg.phase !== "podkid") throw new GameActionError("Phase changed.");
 
         const allDefended = fg.table.every((p) => p.defend);
+        let defenderTookCards = false;
         if (allDefended) {
+          // Cards are discarded — defender successfully defended, will draw below
           for (const pair of fg.table) {
             fg.discard.push(pair.attack);
             if (pair.defend) fg.discard.push(pair.defend);
           }
           fg.table = [];
         } else {
+          // Defender takes cards — they do NOT draw from the deck after
           const fd = fg.players[fg.defender_idx];
           if (fd) {
             for (const pair of fg.table) {
@@ -897,16 +912,17 @@ async function handleTurnTimeout(
             }
           }
           fg.table = [];
+          defenderTookCards = true;
         }
 
-        // Refill + check end + advance
+        // Refill active players; skip the defender only when they took cards
+        const fdId = fg.players[fg.defender_idx]?.user_id;
         for (const p of fg.players) {
-          if (isPlayerActive(p)) {
-            const needed = Math.max(0, upTo - p.hand.length);
-            if (needed > 0) {
-              const drawn = drawCards(fg, needed);
-              p.hand.push(...drawn);
-            }
+          if ((defenderTookCards && p.user_id === fdId) || !isPlayerActive(p)) continue;
+          const needed = Math.max(0, upTo - p.hand.length);
+          if (needed > 0) {
+            const drawn = drawCards(fg, needed);
+            p.hand.push(...drawn);
           }
         }
         if (fg.deck.length === 0) {
@@ -1025,6 +1041,13 @@ async function handleLeaveRoom(ctx: Ctx, rid: string, uid: number): Promise<void
           updatedRoom = await updateRoom(rid, (fresh) => {
             const fg = fresh.game;
             if (!fg || fg.phase === "ended") throw new GameActionError("Game ended.");
+            // Mark empty-hand players as "out" when deck is exhausted
+            if (fg.deck.length === 0) {
+              for (const p of fg.players) {
+                if (isPlayerActive(p) && p.hand.length === 0) p.status = "out";
+              }
+            }
+            if (checkGameEnd(fg)) return;
             nextAttackerDefender(fg);
             fg.phase = "attack";
             fg.turn_deadline = now() + TURN_TIMEOUT_MS;
@@ -1035,6 +1058,10 @@ async function handleLeaveRoom(ctx: Ctx, rid: string, uid: number): Promise<void
         }
 
         const ug = updatedRoom.game!;
+        if (ug.phase === "ended") {
+          await broadcastGameEndApi(ctx.api, ug);
+          return;
+        }
         scheduleTurnTimer(ctx.api, rid, ug.turn_deadline);
         await broadcastPublicStateApi(ctx.api, ug);
         for (const p of ug.players) {
@@ -1075,9 +1102,15 @@ async function handleLeaveRoom(ctx: Ctx, rid: string, uid: number): Promise<void
 composer.callbackQuery(/^game:end:(.+)$/, async (ctx) => {
   await ctx.answerCallbackQuery();
   const rid = ctx.match![1];
+  const uid = ctx.from!.id;
   const room = await readRoom(rid);
   if (!room?.game) {
     await ctx.reply("No game in progress.");
+    return;
+  }
+  // Only the host or a player in the game can force-end it
+  if (room.host_id !== uid && !room.game.players.some((p) => p.user_id === uid)) {
+    await ctx.answerCallbackQuery({ text: "Only the host can end the game.", show_alert: true });
     return;
   }
   clearGameTimer(rid);

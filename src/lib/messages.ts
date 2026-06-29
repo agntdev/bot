@@ -94,6 +94,10 @@ export async function sendPrivateHandApi(
 
   const buttons = [...rows];
   if (actionRow.length > 0) buttons.push(actionRow);
+  // Host can force-end the game
+  if (player.user_id === game.host_id) {
+    buttons.push([inlineButton("🏁 End Game", `game:end:${rid}`)]);
+  }
 
   const phaseLabel =
     game.phase === "attack" && isAttacker

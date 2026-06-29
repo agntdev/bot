@@ -12,6 +12,7 @@ async function main() {
   // bot exposes /start + /help + /hand; everything else is reached via menu buttons.
   await setDefaultCommands(bot, [
     { command: "hand", description: "Show your hand of cards" },
+    { command: "leave", description: "Leave the current room or game" },
   ]);
   bot.start();
 }
