@@ -12,7 +12,7 @@ import {
   type StoredRoom,
 } from "../lib/storage.js";
 import { cardBeats, cardToString, tableRanks } from "../lib/cards.js";
-import { now, TURN_TIMEOUT_MS, scheduleGameTimer, clearGameTimer } from "../lib/clock.js";
+import { now, TURN_TIMEOUT_MS, scheduleGameTimer, clearGameTimer, _logTimeout } from "../lib/clock.js";
 import {
   sendPrivateHandApi,
   broadcastPublicStateApi,
@@ -166,6 +166,7 @@ function scheduleTurnTimer(api: Api, rid: string, deadline: number): void {
   scheduleGameTimer(rid, async () => {
     const room = await readRoom(rid);
     if (!room?.game || room.game.phase === "ended") return;
+    if (room.game.resolvedTurnId >= room.game.turnId) return;
     if (now() >= room.game.turn_deadline) {
       console.log("[game] proactive timer fired", { rid, phase: room.game.phase });
       await handleTurnTimeout(api, room.game, rid, room);
@@ -728,6 +729,8 @@ async function advanceTurn(
       nextAttackerDefender(fg);
       fg.phase = "attack";
       fg.turn_deadline = deadline;
+      fg.resolvedTurnId = 0;
+      fg.turnId = (fg.turnId ?? 0) + 1;
     });
   } catch (err) {
     if (GameActionError.is(err)) {
@@ -757,12 +760,25 @@ async function advanceTurn(
 
 // ---- handleTurnTimeout (proactive + reactive) ----
 
+/**
+ * Handle an expired turn. Idempotent: the `resolvedTurnId` gate and
+ * `clearGameTimer` ensure the timeout fires at most once per turn.
+ *
+ * Logs a single audit entry with player id, turn id, and timestamp.
+ */
 async function handleTurnTimeout(
   api: Api,
   g: StoredGameState,
   rid: string,
   room: StoredRoom,
 ): Promise<void> {
+  // ---- idempotency gate: only resolve once per turn ----
+  if (g.resolvedTurnId >= g.turnId) {
+    console.log("[game] turn already resolved — skipping duplicate timeout", {
+      rid, phase: g.phase, turnId: g.turnId, resolvedTurnId: g.resolvedTurnId,
+    });
+    return;
+  }
   clearGameTimer(rid);
 
   const upTo = initialHandSize(room);
@@ -779,8 +795,12 @@ async function handleTurnTimeout(
           const fg = fresh.game;
           if (!fg || fg.phase === "ended") throw new GameActionError("Game ended.");
           if (fg.phase !== "attack") throw new GameActionError("Phase changed.");
+          if (fg.resolvedTurnId >= fg.turnId) throw new GameActionError("Already resolved.");
+          fg.resolvedTurnId = fg.turnId;
           fg.phase = "defend";
           fg.turn_deadline = deadline;
+          // Reset gate so defender gets their own timeout window
+          fg.resolvedTurnId = 0;
         });
       } catch (err) {
         if (GameActionError.is(err)) return;
@@ -788,6 +808,8 @@ async function handleTurnTimeout(
       }
 
       const ug = updatedRoom.game!;
+      _logTimeout({ roomId: rid, playerId: g.players[g.attacker_idx]?.user_id ?? 0, turnId: g.turnId, phase: "attack", timestamp: now() });
+
       scheduleTurnTimer(api, rid, ug.turn_deadline);
       await broadcastPublicStateApi(api, ug);
       await sendPrivateHandApi(api, ug, ug.players[ug.defender_idx], rid);
@@ -812,7 +834,11 @@ async function handleTurnTimeout(
           const fg = fresh.game;
           if (!fg || fg.phase === "ended") throw new GameActionError("Game ended.");
           if (fg.phase !== "attack") throw new GameActionError("Phase changed.");
+          if (fg.resolvedTurnId >= fg.turnId) throw new GameActionError("Already resolved.");
+          fg.resolvedTurnId = fg.turnId;
           nextAttackerDefender(fg);
+          fg.turnId = (fg.turnId ?? 0) + 1;
+          fg.resolvedTurnId = 0;
           fg.phase = "attack";
           fg.turn_deadline = deadline;
         });
@@ -822,6 +848,8 @@ async function handleTurnTimeout(
       }
 
       const ug = updatedRoom.game!;
+      _logTimeout({ roomId: rid, playerId: oldAttackerId ?? 0, turnId: g.turnId, phase: "attack", timestamp: now() });
+
       scheduleTurnTimer(api, rid, ug.turn_deadline);
       await broadcastPublicStateApi(api, ug);
       for (const p of ug.players) {
@@ -843,6 +871,8 @@ async function handleTurnTimeout(
         const fg = fresh.game;
         if (!fg || fg.phase === "ended") throw new GameActionError("Game ended.");
         if (fg.phase !== "defend") throw new GameActionError("Phase changed.");
+        if (fg.resolvedTurnId >= fg.turnId) throw new GameActionError("Already resolved.");
+        fg.resolvedTurnId = fg.turnId;
         const fd = fg.players[fg.defender_idx];
         if (fd) {
           for (const pair of fg.table) {
@@ -862,6 +892,8 @@ async function handleTurnTimeout(
         }
         if (checkGameEnd(fg)) return;
         nextAttackerDefender(fg);
+        fg.turnId = (fg.turnId ?? 0) + 1;
+        fg.resolvedTurnId = 0;
         fg.phase = "attack";
         fg.turn_deadline = deadline;
       });
@@ -872,9 +904,12 @@ async function handleTurnTimeout(
 
     const ug = updatedRoom.game!;
     if (ug.phase === "ended") {
+      _logTimeout({ roomId: rid, playerId: defenderId ?? 0, turnId: g.turnId, phase: "defend", timestamp: now() });
       await broadcastGameEndApi(api, ug);
       return;
     }
+    _logTimeout({ roomId: rid, playerId: defenderId ?? 0, turnId: g.turnId, phase: "defend", timestamp: now() });
+
     scheduleTurnTimer(api, rid, ug.turn_deadline);
     await broadcastPublicStateApi(api, ug);
     for (const p of ug.players) {
@@ -892,6 +927,8 @@ async function handleTurnTimeout(
         const fg = fresh.game;
         if (!fg || fg.phase === "ended") throw new GameActionError("Game ended.");
         if (fg.phase !== "podkid") throw new GameActionError("Phase changed.");
+        if (fg.resolvedTurnId >= fg.turnId) throw new GameActionError("Already resolved.");
+        fg.resolvedTurnId = fg.turnId;
 
         const allDefended = fg.table.every((p) => p.defend);
         if (allDefended) {
@@ -928,6 +965,8 @@ async function handleTurnTimeout(
         }
         if (checkGameEnd(fg)) { gameEnded = true; return; }
         nextAttackerDefender(fg);
+        fg.turnId = (fg.turnId ?? 0) + 1;
+        fg.resolvedTurnId = 0;
         fg.phase = "attack";
         fg.turn_deadline = now() + TURN_TIMEOUT_MS;
       });
@@ -939,6 +978,8 @@ async function handleTurnTimeout(
     if (!updatedRoom) return;
 
     const ug = updatedRoom.game!;
+    _logTimeout({ roomId: rid, playerId: g.players[g.defender_idx]?.user_id ?? 0, turnId: g.turnId, phase: "podkid", timestamp: now() });
+
     if (gameEnded || ug.phase === "ended") {
       await broadcastGameEndApi(api, ug);
       return;
@@ -1138,13 +1179,12 @@ composer.use(async (ctx, next) => {
   if (!room?.game || room.game.phase === "ended") return next();
 
   const g = room.game;
-  if (now() > g.turn_deadline) {
-    console.log("[game] reactive timeout sweep", { rid, phase: g.phase });
-    await handleTurnTimeout(ctx.api, g, rid, room);
-    return;
-  }
+  // Gate: skip if already resolved or not yet expired
+  if (g.resolvedTurnId >= g.turnId || now() <= g.turn_deadline) return next();
 
-  return next();
+  console.log("[game] reactive timeout sweep", { rid, phase: g.phase });
+  await handleTurnTimeout(ctx.api, g, rid, room);
+  return;
 });
 
 /** Exported for room.ts to use in proactive timer scheduling. */
