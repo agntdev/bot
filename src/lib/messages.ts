@@ -52,9 +52,14 @@ export async function sendPrivateHandApi(
   } else if (game.phase === "defend" && isDefender) {
     canAct = true;
     actionPrefix = "def";
-  } else if (game.phase === "podkid" && !isDefender && player.status === "playing") {
-    canAct = true;
-    actionPrefix = "pod";
+  } else if (game.phase === "podkid") {
+    if (isDefender) {
+      canAct = true;
+      actionPrefix = "def";
+    } else if (player.status === "playing") {
+      canAct = true;
+      actionPrefix = "pod";
+    }
   }
 
   const isWaiting = !canAct;
@@ -85,7 +90,7 @@ export async function sendPrivateHandApi(
   if (game.phase === "attack" && isAttacker && game.table.length > 0) {
     actionRow.push(inlineButton("✅ Done attacking", `done:${rid}`));
   }
-  if (game.phase === "defend" && isDefender) {
+  if ((game.phase === "defend" || game.phase === "podkid") && isDefender) {
     actionRow.push(inlineButton("⛔ Take cards", `take:${rid}`));
   }
   if (game.phase === "podkid" && !isDefender && player.status === "playing") {
@@ -98,7 +103,7 @@ export async function sendPrivateHandApi(
   const phaseLabel =
     game.phase === "attack" && isAttacker
       ? "🎯 Your turn to attack!"
-      : game.phase === "defend" && isDefender
+      : (game.phase === "defend" || game.phase === "podkid") && isDefender
         ? "🛡 Defend!"
         : game.phase === "podkid" && !isDefender && player.status === "playing"
           ? "🎯 Toss more cards in!"

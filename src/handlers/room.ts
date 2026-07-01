@@ -23,6 +23,7 @@ import {
   formatPlayerListLobby,
 } from "../lib/messages.js";
 import { handleTurnTimeout } from "./game.js";
+import crypto from "node:crypto";
 
 // ---- register main-menu items ----
 registerMainMenuItem({ label: "🎮 Create", data: "room:create", order: 10 });
@@ -36,7 +37,7 @@ function genRoomId(): string {
   const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
   let id = "";
   for (let i = 0; i < 6; i++) {
-    id += chars[Math.floor(Math.random() * chars.length)];
+    id += chars[crypto.randomInt(0, chars.length)];
   }
   return id;
 }

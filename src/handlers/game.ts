@@ -6,6 +6,7 @@ import {
   updateRoom,
   deleteRoom,
   getUserRoom,
+  clearUserRoom,
   type StoredGameState,
   type StoredPlayer,
   type StoredCard,
@@ -314,7 +315,7 @@ composer.callbackQuery(/^def:(.+):(\d+)$/, async (ctx) => {
     return;
   }
 
-  if (g.phase !== "defend") {
+  if (g.phase !== "defend" && g.phase !== "podkid") {
     await ctx.reply("Not the defend phase right now.");
     return;
   }
@@ -352,7 +353,7 @@ composer.callbackQuery(/^def:(.+):(\d+)$/, async (ctx) => {
     updatedRoom = await updateRoom(rid, (fresh) => {
       const fg = fresh.game;
       if (!fg || fg.phase === "ended") throw new GameActionError("Game already ended.");
-      if (fg.phase !== "defend") throw new GameActionError("Phase changed — not defend anymore.");
+      if (fg.phase !== "defend" && fg.phase !== "podkid") throw new GameActionError("Phase changed — not defend anymore.");
       const fd = fg.players[fg.defender_idx];
       if (!fd || fd.user_id !== uid) throw new GameActionError("You're no longer the defender.");
       if (!fd.hand[idx]) throw new GameActionError("Card isn't in your hand anymore.");
@@ -572,6 +573,15 @@ composer.callbackQuery(/^take:(.+)$/, async (ctx) => {
         }
       }
 
+      // Mark empty-hand players as "out" when deck is exhausted
+      if (fg.deck.length === 0) {
+        for (const p of fg.players) {
+          if (isPlayerActive(p) && p.hand.length === 0) p.status = "out";
+        }
+      }
+
+      if (checkGameEnd(fg)) return;
+
       fg.phase = "attack";
       fg.turn_deadline = deadline;
       fg.timeout_resolved = false;
@@ -585,6 +595,12 @@ composer.callbackQuery(/^take:(.+)$/, async (ctx) => {
   }
 
   const ug = updatedRoom.game!;
+  if (ug.phase === "ended") {
+    console.log("[game] game ended via take", { rid });
+    await broadcastGameEndApi(ctx.api, ug);
+    return;
+  }
+
   scheduleTurnTimer(ctx.api, rid, ug.turn_deadline);
   await broadcastPublicStateApi(ctx.api, ug);
   await sendPrivateHandApi(ctx.api, ug, ug.players[ug.defender_idx], rid);
@@ -968,7 +984,10 @@ async function handleTurnTimeout(
         }
 
         // Refill + check end + advance
+        // If defender took cards, skip them from refill (match normal "Take cards" flow)
+        const skipUid = allDefended ? null : fg.players[fg.defender_idx]?.user_id;
         for (const p of fg.players) {
+          if (p.user_id === skipUid) continue;
           if (isPlayerActive(p)) {
             const needed = Math.max(0, upTo - p.hand.length);
             if (needed > 0) {
@@ -1117,6 +1136,7 @@ async function handleLeaveRoom(ctx: Ctx, rid: string, uid: number): Promise<void
       await broadcastPublicStateApi(ctx.api, g);
     }
     await ctx.reply("You've left the game. 👋");
+    await clearUserRoom(uid);
   } else {
     // Lobby leave — use updateRoom for atomicity
     const playerName = player.telegram_name;
@@ -1143,6 +1163,7 @@ async function handleLeaveRoom(ctx: Ctx, rid: string, uid: number): Promise<void
       }
     }
     await ctx.reply("You've left the room. 👋");
+    await clearUserRoom(uid);
   }
 }
 
