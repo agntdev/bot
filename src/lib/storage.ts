@@ -32,6 +32,12 @@ export interface StoredGameState {
   turn_deadline: number;
   room_id: string;
   host_id: number;
+  /** Prevents duplicate timeout handling — set true when a timeout fires,
+   *  cleared when a new deadline is set. */
+  timeout_resolved: boolean;
+  /** Monotonic counter incremented each time the active player rotates
+   *  (a new logical turn); used for timeout audit logging. */
+  turn_id: number;
 }
 
 export interface StoredRoom {

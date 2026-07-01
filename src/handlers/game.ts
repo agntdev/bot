@@ -71,6 +71,9 @@ function nextAttackerDefender(game: StoredGameState): void {
     newDefIdx = (newDefIdx + 1) % game.players.length;
   }
   game.defender_idx = newDefIdx;
+
+  // Bump turn id each time the active pair rotates — used for timeout audit logging.
+  game.turn_id = (game.turn_id ?? 0) + 1;
 }
 
 function checkGameEnd(g: StoredGameState): boolean {
@@ -263,6 +266,7 @@ composer.callbackQuery(/^atk:(.+):(\d+)$/, async (ctx) => {
       const played = fa.hand.splice(idx, 1)[0];
       fg.table.push({ attack: played });
       fg.turn_deadline = deadline;
+      fg.timeout_resolved = false;
     });
   } catch (err) {
     if (GameActionError.is(err)) {
@@ -368,6 +372,7 @@ composer.callbackQuery(/^def:(.+):(\d+)$/, async (ctx) => {
       if (allDefended) {
         fg.phase = "podkid";
         fg.turn_deadline = newDeadline;
+        fg.timeout_resolved = false;
       }
     });
   } catch (err) {
@@ -452,6 +457,7 @@ async function handlePodkid(
       const pc = fp.hand.splice(idx, 1)[0];
       fg.table.push({ attack: pc });
       fg.turn_deadline = deadline;
+      fg.timeout_resolved = false;
     });
   } catch (err) {
     if (GameActionError.is(err)) {
@@ -568,6 +574,7 @@ composer.callbackQuery(/^take:(.+)$/, async (ctx) => {
 
       fg.phase = "attack";
       fg.turn_deadline = deadline;
+      fg.timeout_resolved = false;
     });
   } catch (err) {
     if (GameActionError.is(err)) {
@@ -627,6 +634,7 @@ composer.callbackQuery(/^done:(.+)$/, async (ctx) => {
         if (fg.table.length === 0) throw new GameActionError("Must attack with at least one card.");
         fg.phase = "defend";
         fg.turn_deadline = deadline;
+        fg.timeout_resolved = false;
       });
     } catch (err) {
       if (GameActionError.is(err)) {
@@ -728,6 +736,7 @@ async function advanceTurn(
       nextAttackerDefender(fg);
       fg.phase = "attack";
       fg.turn_deadline = deadline;
+      fg.timeout_resolved = false;
     });
   } catch (err) {
     if (GameActionError.is(err)) {
@@ -763,7 +772,67 @@ async function handleTurnTimeout(
   rid: string,
   room: StoredRoom,
 ): Promise<void> {
+  // ---- ATOMIC GATE: claim the timeout slot for this turn ----
+  // Mutiple sources (reactive sweep + proactive timer) can race to
+  // handle the same expired turn. The first caller to atomically set
+  // `timeout_resolved` claims it; all others bail immediately.
+  const timedOutTurnId = g.turn_id;
+  const timedOutPhase = g.phase;
+  const timedOutUserId =
+    timedOutPhase === "defend" || timedOutPhase === "podkid"
+      ? g.players[g.defender_idx]?.user_id
+      : g.players[g.attacker_idx]?.user_id;
+
+  let claimed = false;
+  try {
+    await updateRoom(rid, (fresh) => {
+      const fg = fresh.game;
+      if (!fg || fg.phase === "ended") throw new GameActionError("Game ended.");
+      // Guard: another caller already resolved this timeout.
+      if (fg.timeout_resolved) throw new GameActionError("already-resolved");
+      fg.timeout_resolved = true;
+      claimed = true;
+    });
+  } catch (err) {
+    if (GameActionError.is(err) && err.message === "already-resolved") {
+      console.log("[game] timeout already resolved — bailing", { rid, turnId: timedOutTurnId });
+      return;
+    }
+    if (GameActionError.is(err)) return; // game ended or gone
+    throw err;
+  }
+
+  if (!claimed) return;
+
   clearGameTimer(rid);
+
+  // ---- AUDIT LOG ----
+  console.log("[game] turn timeout fired", {
+    rid,
+    playerId: timedOutUserId,
+    turnId: timedOutTurnId,
+    phase: timedOutPhase,
+    timestamp: now(),
+  });
+
+  // ---- NOTIFICATION: room + offending player ----
+  const playerName = timedOutUserId
+    ? g.players.find((p) => p.user_id === timedOutUserId)?.telegram_name
+    : "Someone";
+  const phaseLabel = timedOutPhase === "attack" ? "attack" : timedOutPhase === "defend" ? "defend" : "podkid";
+  const notifText = `⏰ ${playerName}'s ${phaseLabel} phase timed out — the game moved on.`;
+
+  for (const p of g.players) {
+    if (p.status === "left" || p.status === "durak" || p.status === "out") continue;
+    try {
+      await api.sendMessage(p.user_id, notifText);
+    } catch {}
+  }
+  if (timedOutUserId) {
+    try {
+      await api.sendMessage(timedOutUserId, "⏰ Your turn timed out.");
+    } catch {}
+  }
 
   const upTo = initialHandSize(room);
 
@@ -781,6 +850,7 @@ async function handleTurnTimeout(
           if (fg.phase !== "attack") throw new GameActionError("Phase changed.");
           fg.phase = "defend";
           fg.turn_deadline = deadline;
+          fg.timeout_resolved = false;
         });
       } catch (err) {
         if (GameActionError.is(err)) return;
@@ -796,15 +866,8 @@ async function handleTurnTimeout(
           await sendPrivateHandApi(api, ug, p, rid);
         }
       }
-      try {
-        await api.sendMessage(
-          ug.players[ug.attacker_idx].user_id,
-          "⏰ Time's up — your attack passed to the defender.",
-        );
-      } catch {}
     } else {
       // Attacker timed out without playing any cards → skip their turn
-      const oldAttackerId = g.players[g.attacker_idx]?.user_id;
       const deadline = now() + TURN_TIMEOUT_MS;
       let updatedRoom: StoredRoom;
       try {
@@ -815,6 +878,7 @@ async function handleTurnTimeout(
           nextAttackerDefender(fg);
           fg.phase = "attack";
           fg.turn_deadline = deadline;
+          fg.timeout_resolved = false;
         });
       } catch (err) {
         if (GameActionError.is(err)) return;
@@ -827,15 +891,9 @@ async function handleTurnTimeout(
       for (const p of ug.players) {
         if (isPlayerActive(p)) await sendPrivateHandApi(api, ug, p, rid);
       }
-      try {
-        if (oldAttackerId) {
-          await api.sendMessage(oldAttackerId, "⏰ Your turn timed out — moving on.");
-        }
-      } catch {}
     }
   } else if (g.phase === "defend") {
     // Defender timed out → take all cards
-    const defenderId = g.players[g.defender_idx]?.user_id;
     const deadline = now() + TURN_TIMEOUT_MS;
     let updatedRoom: StoredRoom;
     try {
@@ -864,6 +922,7 @@ async function handleTurnTimeout(
         nextAttackerDefender(fg);
         fg.phase = "attack";
         fg.turn_deadline = deadline;
+        fg.timeout_resolved = false;
       });
     } catch (err) {
       if (GameActionError.is(err)) return;
@@ -880,9 +939,6 @@ async function handleTurnTimeout(
     for (const p of ug.players) {
       if (isPlayerActive(p)) await sendPrivateHandApi(api, ug, p, rid);
     }
-    try {
-      if (defenderId) await api.sendMessage(defenderId, "⏰ Time's up — you took all the cards.");
-    } catch {}
   } else if (g.phase === "podkid") {
     // Podkid timed out → if all defended, discard; else defender takes
     let gameEnded = false;
@@ -930,6 +986,7 @@ async function handleTurnTimeout(
         nextAttackerDefender(fg);
         fg.phase = "attack";
         fg.turn_deadline = now() + TURN_TIMEOUT_MS;
+        fg.timeout_resolved = false;
       });
     } catch (err) {
       if (GameActionError.is(err)) return;
@@ -1040,6 +1097,7 @@ async function handleLeaveRoom(ctx: Ctx, rid: string, uid: number): Promise<void
             nextAttackerDefender(fg);
             fg.phase = "attack";
             fg.turn_deadline = now() + TURN_TIMEOUT_MS;
+            fg.timeout_resolved = false;
           });
         } catch (err) {
           if (GameActionError.is(err)) return;
