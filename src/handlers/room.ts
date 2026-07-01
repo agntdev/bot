@@ -494,6 +494,8 @@ composer.callbackQuery(/^game:start:(.+)$/, async (ctx) => {
     turn_deadline: now() + TURN_TIMEOUT_MS,
     room_id: rid,
     host_id: room.host_id,
+    timeout_resolved: false,
+    turn_id: 1,
   };
 
   room.game = game;

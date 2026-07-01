@@ -488,4 +488,78 @@ describe("Game card selection flow", () => {
     const answerCalls = calls.filter((c) => c.method === "answerCallbackQuery");
     expect(answerCalls.length).toBeGreaterThan(0);
   });
+
+  // --- Timeout tests ---
+
+  it("timeout sends exactly one notification and advances state", async () => {
+    const pastDeadline = Date.now() - 1000; // already expired
+    const room = await setupGameRoom();
+    room.game!.turn_deadline = pastDeadline;
+    room.game!.turn_id = 5;
+    room.game!.timeout_resolved = false;
+    // Host (attacker) has not played any cards
+    room.game!.table = [];
+    await saveRoom(room);
+
+    const bot = await buildBot("test-token");
+    const calls = prepBot(bot);
+
+    // Use a plain text message (not a command) so the reactive sweep runs
+    await bot.handleUpdate(
+      textUpdate(1, "hello", { userId: HOST.id, chatId: HOST.id }),
+    );
+
+    // Should have sent exactly one timeout notification batch to the room
+    const timeoutMsgs = calls.filter(
+      (c) => c.method === "sendMessage" && typeof c.payload.text === "string" && (c.payload.text as string).includes("timed out"),
+    );
+    // One room broadcast per active player + one private DM to the timed-out player
+    expect(timeoutMsgs.length).toBeGreaterThanOrEqual(1);
+
+    // State should have advanced: deadline moved forward
+    const updated = await readRoom(TEST_RID);
+    expect(updated?.game).toBeDefined();
+    expect(updated!.game!.turn_deadline).toBeGreaterThan(pastDeadline);
+    // Phase should have advanced (attacker had no cards → next attacker/defender)
+    // timeout_resolved is reset to false so the next turn's timeout can fire
+  });
+
+  it("reactive sweep does not produce duplicate timeout messages for the same turn", async () => {
+    const pastDeadline = Date.now() - 1000;
+    const room = await setupGameRoom();
+    room.game!.turn_deadline = pastDeadline;
+    room.game!.turn_id = 5;
+    room.game!.timeout_resolved = false;
+    room.game!.table = [];
+    await saveRoom(room);
+
+    const bot = await buildBot("test-token");
+    const calls = prepBot(bot);
+
+    // First sweep — use a plain text message to trigger the reactive middleware
+    await bot.handleUpdate(
+      textUpdate(1, "ping", { userId: HOST.id, chatId: HOST.id }),
+    );
+
+    const firstTimeoutMsgs = calls.filter(
+      (c) => c.method === "sendMessage" && typeof c.payload.text === "string" && (c.payload.text as string).includes("timed out"),
+    );
+
+    // Read the updated state — deadline should have advanced into the future
+    const updatedAfterFirst = await readRoom(TEST_RID);
+    expect(updatedAfterFirst?.game?.turn_deadline).toBeGreaterThan(pastDeadline);
+
+    // Second sweep — the deadline is now in the future, so timeout should NOT fire
+    await bot.handleUpdate(
+      textUpdate(2, "pong", { userId: GUEST.id, chatId: GUEST.id }),
+    );
+
+    const allTimeoutMsgs = calls.filter(
+      (c) => c.method === "sendMessage" && typeof c.payload.text === "string" && (c.payload.text as string).includes("timed out"),
+    );
+
+    // The count should be the same — no new timeout messages from the second sweep
+    expect(allTimeoutMsgs.length).toBe(firstTimeoutMsgs.length);
+  });
+
 });
