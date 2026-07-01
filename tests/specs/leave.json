@@ -1,0 +1,13 @@
+[
+  {
+    "name": "/leave without a room shows error",
+    "steps": [
+      {
+        "send": { "text": "/leave" },
+        "expect": [
+          { "method": "sendMessage", "payload": { "text": "You're not in a room right now." } }
+        ]
+      }
+    ]
+  }
+]
