@@ -133,27 +133,59 @@ function enqueueRoomLock(rid: string): () => void {
 /**
  * Serialized update: enqueues a per-room lock so only one writer mutates
  * a given room at a time, then reads → mutates → saves (with version
- * increment). Returns the updated room.
+ * check). Returns the updated room.
+ *
+ * Uses optimistic concurrency: reads the room's current _version, applies
+ * the mutation, then verifies the stored version hasn't changed before
+ * writing. If a concurrent writer (in another process behind a load
+ * balancer) raced in, the version won't match and updateRoom retries.
+ *
+ * Max retries (MAX_RETRIES = 5) bounds the loop so a sustained write
+ * conflict fails fast rather than spinning forever.
  *
  * When Redis-backed storage is available in a multi-process deployment,
- * the lock is process-local only — inter-process races remain possible
- * but are far less likely for a game bot's request rate. The version
- * field is still incremented as a defense-in-depth check.
+ * the per-process lock serializes intra-process writes; the version check
+ * catches inter-process races.
  */
 export async function updateRoom(
   rid: string,
   mutate: (room: StoredRoom) => void,
 ): Promise<StoredRoom> {
-  const release = enqueueRoomLock(rid);
-  try {
-    const room = await readRoom(rid);
-    if (!room) throw new Error(`Room ${rid} not found`);
-    mutate(room);
-    await saveRoom(room);
-    return room;
-  } finally {
-    release();
+  const MAX_RETRIES = 5;
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    const release = enqueueRoomLock(rid);
+    try {
+      const room = await readRoom(rid);
+      if (!room) throw new Error(`Room ${rid} not found`);
+
+      const expectedVersion = room._version ?? 0;
+
+      // Apply the mutation to the in-memory copy
+      mutate(room);
+
+      // CAS: re-read the store to check version hasn't changed
+      const current = await readRoom(rid);
+      if (!current) throw new Error(`Room ${rid} not found`);
+
+      if (expectedVersion !== (current._version ?? 0)) {
+        // Version mismatch — someone wrote to this room while we were
+        // holding the process-local lock (multi-process deployment).
+        // Release, retry the whole sequence.
+        release();
+        if (attempt < MAX_RETRIES - 1) {
+          console.warn("[storage] CAS version conflict, retrying", { rid, attempt, expectedVersion });
+          continue;
+        }
+        throw new Error(`Room ${rid} version conflict after ${MAX_RETRIES} attempts`);
+      }
+
+      await saveRoom(room);
+      return room;
+    } finally {
+      release();
+    }
   }
+  throw new Error(`Room ${rid} updateRoom exhausted retries`);
 }
 
 /** Test-only: reset all stores. */

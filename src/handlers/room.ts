@@ -193,6 +193,10 @@ composer.callbackQuery(/^room:setmax:(.+):(\d+)$/, async (ctx) => {
     await updateRoom(rid, (room) => {
       if (room.host_id !== ctx.from!.id) throw new Error("not-host");
       if (room.game) throw new Error("game-started");
+      const activeCount = room.players.filter((p) => p.status !== "left").length;
+      if (val < activeCount) {
+        throw new Error(`too-few-slots:${activeCount}`);
+      }
       room.max_players = val;
     });
   } catch (err) {
@@ -202,6 +206,11 @@ composer.callbackQuery(/^room:setmax:(.+):(\d+)$/, async (ctx) => {
     }
     if (err instanceof Error && err.message === "game-started") {
       await ctx.answerCallbackQuery({ text: "Can't change settings after the game starts.", show_alert: true });
+      return;
+    }
+    if (err instanceof Error && err.message?.startsWith("too-few-slots:")) {
+      const count = err.message.split(":")[1];
+      await ctx.answerCallbackQuery({ text: `${val} is too low — there are already ${count} players in the room.`, show_alert: true });
       return;
     }
     await ctx.answerCallbackQuery({ text: "Room not found.", show_alert: true });

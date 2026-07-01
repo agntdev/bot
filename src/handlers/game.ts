@@ -228,9 +228,10 @@ composer.callbackQuery(/^atk:(.+):(\d+)$/, async (ctx) => {
 
   // Cap attacks at the defender's current hand size (max 6).
   // Standard Durak rule: you cannot attack with more cards
-  // than the defender can hold.
+  // than the defender can hold. Always allow at least 1 attack
+  // — a 0-card defender (before refill) must not deadlock the game.
   const defender = g.players[g.defender_idx];
-  const maxAttacks = Math.min(6, defender ? defender.hand.length : 6);
+  const maxAttacks = Math.min(6, Math.max(1, defender ? defender.hand.length : 6));
   if (g.table.length >= maxAttacks) {
     if (maxAttacks <= 0) {
       await ctx.reply("The defender has no cards — tap ✅ Done attacking.");
@@ -261,7 +262,7 @@ composer.callbackQuery(/^atk:(.+):(\d+)$/, async (ctx) => {
       if (fg.table.length > 0 && !tableRanks(fg.table).has(fa.hand[idx].rank)) {
         throw new GameActionError("That rank can't be played anymore.");
       }
-      if (fg.table.length >= Math.min(6, fg.players[fg.defender_idx]?.hand.length ?? 6)) throw new GameActionError("Table is full.");
+      if (fg.table.length >= Math.min(6, Math.max(1, fg.players[fg.defender_idx]?.hand.length ?? 6))) throw new GameActionError("Table is full.");
 
       const played = fa.hand.splice(idx, 1)[0];
       fg.table.push({ attack: played });
@@ -452,7 +453,7 @@ async function handlePodkid(
       if (!tableRanks(fg.table).has(fp.hand[idx].rank)) {
         throw new GameActionError("That rank can't be tossed in anymore.");
       }
-      if (fg.table.length >= Math.min(6, fg.players[fg.defender_idx]?.hand.length ?? 6)) throw new GameActionError("Table is full.");
+      if (fg.table.length >= Math.min(6, Math.max(1, fg.players[fg.defender_idx]?.hand.length ?? 6))) throw new GameActionError("Table is full.");
 
       const pc = fp.hand.splice(idx, 1)[0];
       fg.table.push({ attack: pc });
