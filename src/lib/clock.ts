@@ -69,3 +69,26 @@ export function _clearAllTimers(): void {
 export function _timerCount(): number {
   return timers.size;
 }
+
+/**
+ * Log a single timeout event for auditing. Logged once per resolution —
+ * never per-tick or repeated. Tests can inspect captured logs.
+ */
+export interface TimeoutLogEntry {
+  roomId: string;
+  playerId: number;
+  turnId: number;
+  phase: string;
+  timestamp: number;
+}
+
+export const timeoutLog: TimeoutLogEntry[] = [];
+
+export function _logTimeout(entry: TimeoutLogEntry): void {
+  timeoutLog.push(entry);
+  console.log("[game] timeout resolved", entry);
+}
+
+export function _clearTimeoutLog(): void {
+  timeoutLog.length = 0;
+}

@@ -32,6 +32,10 @@ export interface StoredGameState {
   turn_deadline: number;
   room_id: string;
   host_id: number;
+  /** Monotonically incrementing turn counter for audit logging. Incremented on every turn advance. */
+  turnId: number;
+  /** The turnId that was last resolved by a timeout. When resolvedTurnId === turnId, the current turn's timeout has already fired. */
+  resolvedTurnId: number;
 }
 
 export interface StoredRoom {

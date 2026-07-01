@@ -494,6 +494,8 @@ composer.callbackQuery(/^game:start:(.+)$/, async (ctx) => {
     turn_deadline: now() + TURN_TIMEOUT_MS,
     room_id: rid,
     host_id: room.host_id,
+    resolvedTurnId: 0,
+    turnId: 1,
   };
 
   room.game = game;
@@ -504,6 +506,7 @@ composer.callbackQuery(/^game:start:(.+)$/, async (ctx) => {
   scheduleGameTimer(rid, async () => {
     const fresh = await readRoom(rid);
     if (!fresh?.game || fresh.game.phase === "ended") return;
+    if (fresh.game.resolvedTurnId >= fresh.game.turnId) return;
     if (now() >= fresh.game.turn_deadline) {
       await handleTurnTimeout(ctx.api, fresh.game, rid, fresh);
     }

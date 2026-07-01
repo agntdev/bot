@@ -1,0 +1,13 @@
+[
+  {
+    "name": "attack timeout with no cards advances turn exactly once",
+    "steps": [
+      {
+        "send": { "callback": "atk:TO001:0" },
+        "expect": [
+          { "method": "answerCallbackQuery" }
+        ]
+      }
+    ]
+  }
+]
